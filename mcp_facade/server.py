@@ -191,7 +191,8 @@ def hub_send(
         "跑一条多 agent 编排流水线。steps 是一个数组，每个元素形如\n"
         '  {"id": "draft", "agent": "claude-cli", "prompt": "写一段关于 {{input}} 的初稿"}\n'
         "要点：\n"
-        "- 依赖自动推断：prompt 里写了 {{steps.draft}} 就自动等 draft 完成，不用手写 dependsOn\n"
+        "- 依赖必须显式表达：只有 prompt 里写了 {{steps.draft}} 才会等 draft 完成；\n"
+        "  自然语言描述（「先做 A 再做 B」）不会被识别，那两步会并行跑。\n"
         "- 模板变量：{{input}}（外层输入）、{{steps.<id>}}（某步输出）\n"
         "- 无依赖关系的步骤会并行执行\n"
         "- 默认各步独立会话；要共享下游会话，在该 step 上加 \"sharedContext\": true\n"

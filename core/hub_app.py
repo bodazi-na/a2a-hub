@@ -925,19 +925,29 @@ class Hub:
         """结算上次进程遗留的活跃任务（A2A-09）。
 
         这些任务已经没有 worker 在跑了，但状态还停在 submitted/working，
-        调用方会一直等下去。启动时统一标成 failed（interrupted），
-        让语义明确 —— 而不是让它们永远悬着。
+        调用方会一直等下去。启动时统一标成 failed（interrupted）。
+
+        **注意语义**：`ok=false` 不代表「什么都没干」—— 任务被中断时，
+        下游可能已经把文件写进了 workspace。所以错误文案里明确提示先验盘，
+        而不是让调用方以为可以安全重跑。
         """
         orphans = self.store.list_active_tasks()
         for task in orphans:
             self.store.add_message(
                 task["id"], role="agent", kind="status",
-                content=[{"text": "interrupted: hub restarted, no worker for this task"}],
+                content=[{"text": (
+                    "interrupted: hub restarted while this task was active; "
+                    "side effects (e.g. files written to workspace) may already exist"
+                )}],
             )
             self.store.update_task(
                 task["id"], state="failed",
-                error="interrupted: hub restarted while this task was active",
+                error=("interrupted: hub 在任务执行期间重启。"
+                       "**该任务可能已产生副作用**（写入 workspace 的文件等）—— "
+                       "重跑前请先检查 workspace，不要仅凭 ok=false 判定它什么都没做。"),
                 finished=True, only_from=ACTIVE_STATES,
+                metadata={**(task.get("metadata") or {}),
+                          "interrupted": True, "sideEffectsPossible": True},
             )
         return len(orphans)
 

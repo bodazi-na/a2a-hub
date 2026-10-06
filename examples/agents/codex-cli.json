@@ -1,0 +1,8 @@
+{
+  "_comment": "示例：Codex CLI（npm 全局包 @openai/codex）。",
+  "adapter": "CodexCLI",
+  "options": {
+    "command": ["<APPDATA>\\npm\\codex.cmd"],
+    "timeout": 300
+  }
+}

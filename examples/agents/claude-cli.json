@@ -1,0 +1,8 @@
+{
+  "_comment": "示例：Claude Code CLI（npm 全局包 @anthropic-ai/claude-code）。",
+  "adapter": "ClaudeCLI",
+  "options": {
+    "command": ["<APPDATA>\\npm\\claude.cmd"],
+    "timeout": 300
+  }
+}

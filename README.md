@@ -18,43 +18,71 @@
 
 ## 快速开始
 
+**不需要装任何真实的 AI CLI。** 仓库自带一个零依赖的演示下游
+（`examples/mock_agent.py`，只用 starlette —— 那本来就是 hub 的依赖）。
+五分钟内你能看到整条链路跑通。
+
 ```bash
-# 1) 依赖（已预装在隔离 venv）
-#    C:\Users\a1299\.workbuddy-ai\binaries\python\envs\a2a-hub
+# 1) 装（虚拟环境随便建在哪儿）
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e .
+```
 
-# 2) 注册一个下游 agent
-# CLI 类（推荐，零常驻进程）
-python hub.py register --name dsh-cli   --kind cli --config agents/dsh-cli.json   --tag dsh
-python hub.py register --name codex-cli --kind cli --config agents/codex-cli.json --tag codex
+```bash
+# 2) 起一个演示下游（另开一个终端）
+python examples/mock_agent.py --port 9301 --name demo --tag demo
 
-# HTTP 类（下游已经在跑一个 A2A 服务时用；跨机器场景必需）
-# python hub.py register --name dsh --endpoint http://127.0.0.1:9101 --tag dsh
-
-# 3) 看注册表 / 探测健康
+# 3) 把它注册进来
+python hub.py register --name demo --endpoint http://127.0.0.1:9301 --tag demo
 python hub.py agents
-python hub.py probe
+#   demo             a2a_http   health=unknown  tags=demo
 
-# 4) 启动 hub
+# 4) 起 hub（再开一个终端）
 python hub.py serve --host 127.0.0.1 --port 9200
 ```
 
-调用它（标准 A2A）：
+发一个任务（标准 A2A JSON-RPC）：
 
 ```bash
 curl -X POST http://127.0.0.1:9200/ \
   -H "Content-Type: application/json" -H "A2A-Version: 1.0" \
   -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{
         "messageId":"m1","role":"ROLE_USER",
-        "parts":[{"text":"用一句话说明这个目录是做什么的"}],
-        "contextId":"ctx-1"}}}'
+        "parts":[{"text":"你好，hub"}],
+        "contextId":"ctx-demo"}}}'
 ```
 
-指定路由目标或能力：
+你会拿到：
 
 ```jsonc
-"params": { "message": {...}, "agent": "dsh" }      // 显式指定
-"params": { "message": {...}, "tags": ["codex"] }   // 按能力匹配
+{
+  "status": { "state": "TASK_STATE_COMPLETED" },
+  "artifacts": [{ "name": "response",
+                  "parts": [{ "text": "[demo] echo: 你好，hub" }] }]
+}
 ```
+
+**然后把它杀掉再起来试试** —— 任务还在：
+
+```bash
+# Ctrl-C 停掉 hub，重新 python hub.py serve ...
+curl -X POST http://127.0.0.1:9200/ -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"GetTask","params":{"id":"<上面那个 taskId>"}}'
+```
+
+这就是 hub 存在的理由：**任务在任何下游动作之前就已经落库**。
+进程崩了、重启了，状态依然查得到；下游失败也不会丢任务，只会置为 `failed` 并记下原因。
+
+### 接你自己的 agent
+
+演示下游只是让你先看到它工作。接真实工具：
+
+- 用现成的 CLI（claude / codex / dsh / qoder）：见 [适配器](#适配器两类下游) 与
+  [注册一个 CLI agent](#注册一个-cli-agent)；`examples/agents/` 下有四个真实配置样例
+- 下游已经是一个 A2A 服务：直接 `hub.py register --endpoint <url>` 即可
+- 都不是：照着 [写 CLI 适配器必踩的三个坑](#写-cli-适配器必踩的三个坑都实测过)
+  和 `examples/mock_agent.py` 自己写一层
 
 ## 任务模型
 
@@ -110,21 +138,11 @@ A2A 协议也没强制要求，所以那一侧仍是「尽力而为」。
 
 | 类型 | 类 | 对接对象 | 需要常驻进程 |
 | --- | --- | --- | --- |
-| **HTTP** | `A2AHttpAdapter` | 已经在跑的 A2A 服务（如本机的 9100 / 9101 桥） | 是 |
+| **HTTP** | `A2AHttpAdapter` | 已经在跑的 A2A 服务 | 是 |
 | **CLI** | `ClaudeCLI` / `QoderCLI` / `CodexCLI` / `DshCLI` | 直接起子进程调 CLI 本体 | 否 |
 
 CLI 类少一层桥、少一个常驻进程，代价是自己管子进程生命周期、超时、取消。
-
-### 四个 CLI 的实测契约
-
-| CLI | 非交互 | 输出格式 | 会话续接 |
-| --- | --- | --- | --- |
-| claude | `-p --verbose` | `--output-format stream-json` | `--resume <id>` |
-| qodercli | `-p` | `-o stream-json` | `-r <id>` |
-| codex | `exec` | `--json`（JSONL） | `exec resume <id>` |
-| dsh | `--profile headless` | `--json`（NDJSON） | `--session-id <id>` |
-
-输出解析分两族：**claude 族**（claude / qodercli，schema 逐字段一致）与 **jsonl 族**（codex / dsh，逐行事件）。
+**单机自用优先 CLI；跨机器或对外暴露才起桥。**
 
 ### 注册一个 CLI agent
 
@@ -141,20 +159,14 @@ python hub.py register --name dsh-cli --kind cli --config agents/dsh-cli.json --
  "options": {"command": ["<dsh 启动器路径>"], "timeout": 300}}
 ```
 
-Qoder 的 PAT **不要写进配置文件** —— 适配器的 `env` 会继承 hub 进程的环境变量，
-启动时注入即可：`export QODER_PERSONAL_ACCESS_TOKEN=... && python hub.py serve`。
+`examples/agents/` 下有四个真实 CLI 的样例可参考。
 
-### 写 CLI 适配器必踩的三个坑（都实测过）
+> **凭据不要写进配置文件。** 适配器的 `env` 会继承 hub 进程的环境变量，
+> 启动时注入即可：`export QODER_PERSONAL_ACCESS_TOKEN=... && python hub.py serve`。
 
-1. **stdin 要传 prompt 并主动关闭**。既解决 argv 长度问题（Windows CreateProcess 有 32K 上限），
-又给出明确的输入结束信号。**不能简单用 `DEVNULL`** —— 那样既没数据也没有边界，
-codex / claude 会一直等（实测让 codex 挂死 4 分半直到超时）。
-2. **`.cmd` / `.bat` 不能直接被 CreateProcess 执行**，要用 `cmd.exe /c` 包一层。
-   本机四个 CLI 里有三个是 .cmd 启动器。
-3. **claude 的 `--print` 配 `stream-json` 必须带 `--verbose`**，否则直接报错退出。
-4. **取消必须杀进程树**（`taskkill /T /F`），不能只 `proc.kill()`。
-   本机四个 CLI 里三个是 .cmd 启动器，只杀外壳会让真正的执行体变孤儿。
-   验证时注意数**正确的映像名** —— dsh 的执行体是 `DeepSeek Harness.exe` 而不是 `node.exe`。
+**想自己写一层适配器？** 见
+[`docs/architecture.md`](docs/architecture.md#写-cli-适配器必踩的坑全部实测过) ——
+里面有完整的 `Adapter` 契约、下游差异归一化表，以及五个必踩的坑（全部实测过）。
 
 ## 编排
 
@@ -373,107 +385,85 @@ facade 连不上 hub 时会返回明确的错误提示（含「请先运行 hub.
 
 ## 测试
 
-自检脚本按「**是否需要本机环境**」分两组：
-
 ```bash
-python tests/run_all.py          # 单元级（CI 用这个）
-python tests/run_all.py --all    # 单元 + 集成
+python tests/run_all.py          # 单元级 + 平台级（CI 跑这个，零外部依赖）
+python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑）
 python tests/run_all.py --list   # 只看分组
 ```
 
-| 组 | 脚本 | 依赖 |
-| --- | --- | --- |
-| **单元级** | `test_cancel_semantics` · `test_p2_fixes` · `test_adapter_p2` · `test_isolation` | 内存 Store + 假适配器，**零外部依赖** |
-| **集成级** | `test_cli_lifecycle` · `test_kill_tree` · `test_cli_direct` · `test_async_cancel` · `test_p1_fixes` · `test_mcp_facade` | 真实 CLI / Windows 进程命令 / hub 在跑 |
-
-**这条分界线就是「薄核心 / 厚适配器」的边界**：
-
-```
-单元级全绿  ⟺  core 确实与平台无关（store · router · orchestrator · hub_app 的逻辑）
-集成级      ⟺  适配器与本机工具的对接（只能在开发机上验证）
-```
-
-所以 CI 只跑单元级 —— 它同时起到了**架构约束的自动验证器**的作用，
-而不只是防回归。见 `.github/workflows/ci.yml`（ubuntu + windows × py3.10 / py3.13）。
-
-## 目录分层：代码 / 运行时 / 本机配置
-
-这个仓库**可以独立使用，也可以直接开源** —— 代码层不含任何本机路径、凭据或运行时数据。
-
-```
-a2a-hub/                     ← 代码层（进仓库）
-├── core/                    store · registry · router · orchestrator · hub_app · console
-├── adapters/                base · a2a_http · cli
-├── probes/                  process_monitor（本机进程探测）
-├── tests/                   自检脚本（多数可独立运行）
-├── examples/agents/         示例配置（占位符，无本机路径）
-├── hub.py                   命令行入口
-├── pyproject.toml           依赖声明
-└── README.md / LICENSE
-
-以下由 .gitignore 排除（运行时层）：
-├── data/                    SQLite 数据库
-├── workspace/               下游 agent 的工作目录（它们在这里写文件）
-├── agents/                  你的本机 agent 配置（含真实路径与命令）
-└── __pycache__/
-```
-
-**为什么要分**：
-
-- **`workspace/` 必须独立** —— CLI 子进程的 cwd 默认继承 hub 进程，而 hub 通常就跑在代码目录里。
-  不给它独立工作目录的话，agent 随手写个文件就落进仓库（实测把 `history-of-computing.md`
-  和 `memory/` 写进了项目根）。现在 `Hub` 会给没配 `cwd` 的 CLI 适配器注入 `<cwd>/workspace`。
-- **`agents/` 必须独立** —— 里面的配置写死了本机路径（`C:\Users\...`），
-  还可能带模型 ID 之类的环境特定值。仓库里只放 `examples/agents/` 的占位符版本。
-- **凭据不进文件** —— Qoder 的 PAT 走环境变量 `QODER_PERSONAL_ACCESS_TOKEN`，
-  hub 的 token 走 `HUB_TOKEN` 或 `--token`，都不落盘。
-
-**移植到新机器**：`git clone` → `pip install -e .` → 照着 `examples/agents/` 写自己的 `agents/*.json` → 起服务。
+三档的分界线**就是「薄核心 / 厚适配器」的边界**：
+单元级全绿 ⟺ core 确实与平台无关。详见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
 ## 目录结构
+
+仓库可以独立使用、也可以直接开源 —— 代码层不含任何本机路径、凭据或运行时数据。
+下面标了「**运行时**」的几处由 `.gitignore` 排除；为什么要这么分、移植到新机器
+怎么做，见 [`docs/architecture.md`](docs/architecture.md#目录分层代码--运行时--本机配置)。
 
 ```
 a2a-hub/
 ├── core/                  平台无关，可开源
-│   ├── store.py           SQLite 六表 + schema 迁移 + 查询接口
+│   ├── store.py           SQLite 六表 + schema 迁移 + 事务边界 + 查询接口
 │   ├── registry.py        Agent 注册表 + 健康探测
 │   ├── router.py          能力匹配路由
-│   └── orchestrator.py    编排引擎（拓扑分层 + 同层并行 + 模板变量）
+│   ├── orchestrator.py    编排引擎（拓扑分层 + 同层并行 + 模板变量）
 │   ├── hub_app.py         对外 A2A 服务端（含 RunPlan / GetPlan 编排扩展 + admin 端点）
 │   └── console.py         只读控制台（单页 HTML，零前端依赖）
 ├── adapters/              每个下游一层，可插拔
 │   ├── base.py            Adapter 契约 + 下游差异归一化
 │   ├── a2a_http.py        通用 HTTP A2A 适配器（裸 JSON-RPC，零 SDK 依赖）
 │   └── cli.py             CLI 适配器（claude / qodercli / codex / dsh）
-├── agents/                各 CLI agent 的注册配置
+├── mcp_facade/            **可选组件**：把 hub 包成 MCP server，让支持 MCP 的平台能调它
+├── examples/
+│   ├── mock_agent.py      零依赖演示下游（快速开始用的就是它）
+│   ├── agents/            四个真实 CLI 的注册配置样例
+│   ├── mcp/               各平台的 MCP 接入配置样例
+│   └── plan-*.json        编排定义样例
+├── docs/
+│   ├── architecture.md    架构说明（分层 / 数据流 / 扩展点）
+│   └── adr/               架构决策记录（为什么这么选）
+├── tools/
+│   └── run_plan.py        长编排提交器（客户端超时可配、结果落盘）
 ├── probes/
 │   └── process_monitor.py 本机 AI 工具进程探测（适配器 detect 层的实现）
-├── tests/
-│   └── mock_agent.py      最小假下游，用于零成本验证链路
+├── tests/                 三档自检：单元 / 平台 / 集成（见 CONTRIBUTING.md）
 ├── hub.py                 命令行入口
-└── data/hub.db            SQLite（运行时生成）
+├── agents/                本机 agent 注册配置（**运行时**，不进仓库）
+└── data/hub.db            SQLite（**运行时**生成，不进仓库）
 ```
 
 **新增一种执行体 = 新增一个 `Adapter` 子类，core 一行不改。** 这是「厚适配器」的含义。
 
 ## 两个必须知道的坑
 
-都来自实测，写适配器时一定会撞上：
+都来自实测，**命令行验证和写适配器时都会撞上**：
 
-1. **本地探测必须 `trust_env=False`**。本机系统代理（`127.0.0.1:7393`）会把 `127.0.0.1` 的请求变成 **502**（不是 connection refused），极易误判成「服务在跑但报错」。
-2. **拉 Agent Card 与发 JSON-RPC 不要复用同一个 keep-alive 连接**。部分实现（如 codex-a2a）在同一连接上先 GET 再 POST 会稳定返回 404。适配器里每次请求都用独立的 `AsyncClient`。
+1. **本地探测必须绕开系统代理**。机器上若有系统代理，`127.0.0.1` 的请求会被拦下
+   并返回 **502**（不是 connection refused），极易误判成「服务在跑但报错」。
+   命令行加 `--noproxy '*'`，代码里用 `trust_env=False`。
+2. **拉 Agent Card 与发 JSON-RPC 不要复用同一个 keep-alive 连接**。
+   部分 A2A 实现在同一连接上先 GET 再 POST 会稳定返回 404。
 
 ## 已验证
 
 ### 真实下游（2026-10-06 实测）
 
-| 下游 | 端点 | 结果 |
-| --- | --- | --- |
-| **dsh-a2a** | `127.0.0.1:9101` | ✅ 端到端 + 跨轮续接（`continuedSession: true`，session 复用） |
-| **codex-a2a** | `127.0.0.1:9100` | ✅ 端到端 + 跨轮续接（`codexThreadId` 复用） |
-| mock-dsh | `127.0.0.1:9301` | ✅ 测试替身，零成本验证链路 |
+hub 侧走 **CLI 直连**（直接起子进程，零常驻进程）：
 
-**零代码改动接入**：两条真实桥直接注册即可，`a2a_http` 适配器没有为它们写任何特化代码。
+| 下游 | 启动方式 | 结果 |
+| --- | --- | --- |
+| claude-cli | `claude -p --verbose --output-format stream-json` | ✅ 单任务 + 编排 |
+| codex-cli | `codex exec --json --skip-git-repo-check` | ✅ 单任务 + 编排 |
+| dsh-cli | `dsh --profile headless --json` | ✅ 单任务 + 编排 |
+| qoder-cli | `qodercli -p -m <modelID> -o stream-json` | ✅ 单任务 + 编排（走 BYOK，不消耗 Qoder 额度） |
+| demo | `examples/mock_agent.py` | ✅ 零依赖演示下游 |
+
+四个节点曾用 **4 步 2 层**的真实编排一起跑过（三路并行审查 + 汇总），
+完整记录见 [`docs/drill-2026-10-06-real-load.md`](docs/drill-2026-10-06-real-load.md)。
+
+> 早期还有两条常驻 HTTP 桥（`dsh-a2a` / `codex-a2a`），已退役 ——
+> 单机自用走 CLI 更简单，桥留给「跨机器 / 对外暴露」场景。
+> `A2AHttpAdapter` 仍然保留，任何符合 A2A 的服务注册即可用。
 
 ### 能力验证
 
@@ -486,29 +476,53 @@ a2a-hub/
 | 过程回传 | 下游的 status / text / 工具事件映射成消息并持久化 |
 | 动态注册 | 服务运行中注册新 agent 即生效，无需重启（适配器按需构建） |
 
-### 接真实下游（实测命令）
+### 编排与一致性（实测）
+
+| 项 | 结果 |
+| --- | --- |
+| 并行扇出 | 三路 agent 的 `startedAt` 相差 **3.5 毫秒**（真并行，非伪并行） |
+| 取消编排 step | `CancelTask` 真的中断下游子进程树；plan 收尾为 `ok=False` 并正常返回 |
+| 失败策略 | 默认 fail-fast；`onError: continue` 可按步覆盖 |
+| 一致性 | 读用快照事务、写用原子合并；跨语句撕裂读有回归测试兜住 |
+| 性能 | 50 个过程事件落库的事件循环阻塞：**193ms → 0.9ms** |
+
+### 三档自检（当前全绿）
 
 ```bash
-# DSH 桥（工作区外的运行时 Python + PYTHONPATH）
-cd /d/DS-harness/.dsh-a2a
-export PYTHONPATH="D:/DS-harness/.dsh-a2a/src;D:/DS-harness/.dsh-a2a/.venv/Lib/site-packages;D:/DS-harness/.dsh-a2a/.venv/Lib/site-packages/win32;D:/DS-harness/.dsh-a2a/.venv/Lib/site-packages/win32/lib"
-export DSH_MCP_WORKDIR="D:/DS-harness/.dsh-a2a" DSH_MCP_HOST=127.0.0.1 DSH_MCP_PORT=9101 DSH_MCP_PROFILE=headless
-"C:/Users/a1299/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe" -m dsh_mcp
-
-# Codex 桥
-cd "/c/Users/a1299/Documents/Codex/2026-10-04/codex/outputs/codex-a2a"
-export CODEX_A2A_WORKDIR="C:/Users/a1299/Documents/Codex/2026-10-04/codex/work/a2a-demo" CODEX_A2A_HOST=127.0.0.1 CODEX_A2A_PORT=9100 CODEX_A2A_SANDBOX=workspace-write
-.venv/Scripts/python.exe -m codex_a2a
-
-# 注册
-python hub.py register --name dsh   --endpoint http://127.0.0.1:9101 --tag dsh
-python hub.py register --name codex --endpoint http://127.0.0.1:9100 --tag codex
+python tests/run_all.py          # 单元级 + 平台级（CI 跑这个）
+python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑）
 ```
 
-## 下一步
+| 档 | 数量 | 依赖 |
+| --- | --- | --- |
+| 单元级 | 10 套 | 无（假适配器 + 内存 Store） |
+| 平台级 | 1 套 | 会起真实进程，但只用 `sys.executable`；非 Windows 自动跳过 |
+| 集成级 | 6 套 | 真实 CLI / Windows 进程命令 / hub 在跑 |
 
-- **接真实下游**：见下方「怎么选接入方式」
-- **Qoder 适配器**：`qodercli -p -o stream-json`，注意 `-m` 必须传 modelID（UUID），且 stdout 会混非 JSON 文本需按行过滤
-- **CLI 类适配器**：`adapters/cli.py`，把 `claude -p` / `codex exec` / `qodercli -p` 包成同一契约
-- **编排**：串行链、并行扇出、主管-工人（依赖本内核的持久化）
-- **统一审计**：跨 agent 的调用链追踪
+## 文档
+
+| 文件 | 内容 |
+| --- | --- |
+| [`docs/architecture.md`](docs/architecture.md) | 分层、数据流、扩展点 —— **想改代码先看这个** |
+| [`docs/adr/`](docs/adr/) | 架构决策记录：为什么只做 A2A、为什么 CLI 优先、为什么不用线程、为什么用 Job Object…… |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 怎么跑测试、怎么写新适配器、提交约定 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 变更历史（含 schema 迁移说明） |
+| [`docs/drill-2026-10-06-real-load.md`](docs/drill-2026-10-06-real-load.md) | 一次真实负载演练的完整记录（用它自己审自己，暴露并修掉 2 个 P0） |
+
+## 已知边界
+
+诚实地列出来，免得你踩了才发现：
+
+- **只实现 Windows**。接口是平台无关的，但 Job Object、`cmd.exe` 包裹、
+  `taskkill` 兜底这些只在 Windows 上验证过。非 Windows 下 CLI 适配器未经测试。
+- **不做流式**。Agent Card 里声明 `streaming: false` —— 过程回传是
+  `adapter.call` 跑完之后一次性批量落库的，不是实时流。所以审计时间线
+  **能还原顺序，不能用来分析时序**。
+- **`RunPlan` 是同步阻塞的**。长编排会超过客户端超时，届时你拿不到结果也拿不到
+  `planId`。用 `tools/run_plan.py`（超时可配 + 结果落盘）。
+- **各节点写盘能力不一致且不可声明**。codex-cli 是沙箱只读、qoder-cli 会等人
+  点授权（hub 起的子进程没有 TTY），claude-cli / dsh-cli 可写。需要产出文件时
+  别指望前两个。
+- **`hub → WorkBuddy` 这条没打通**，是设计边界不是缺陷：对方只暴露工具集、
+  没有任务级入口。反方向（WorkBuddy → hub）是通的。
+- **尚未做**：CI 只跑单元级 + 平台级；无 PyPI 发布；无 Docker。

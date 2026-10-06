@@ -1,15 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""最小 A2A 下游 agent（测试用假执行体）。
+"""最小 A2A 下游 agent —— **零外部依赖的演示执行体**。
 
-它不做任何真实工作，只按 A2A 协议回一个已完成的 task，
-用途是验证 hub 的注册 → 路由 → 派活 → 落库 → 查询整条链路，
-不依赖任何真实模型，零成本、零外部依赖。
+它不做任何真实工作，只按 A2A 协议回一个已完成的 task。用途有两个：
 
-  python tests/mock_agent.py --port 9301 --name mock-dsh --tag dsh
+1. **让你在没装任何真实 CLI（claude / codex / dsh / qoder）的情况下，
+   五分钟内看到 hub 的整条链路跑通** —— 注册 → 路由 → 派活 → 落库 → 查询。
+2. **当作写真实适配器的参照**：协议面刻意与真实的 A2A 服务对齐
+   （camelCase 字段 + `A2A-Version` 头），照着它实现即可。
 
-协议面刻意与 dsh-a2a 对齐（camelCase 字段 + A2A-Version 头），
-这样它既是 hub 的测试替身，也是将来写真实适配器的参照。
+```bash
+python examples/mock_agent.py --port 9301 --name demo --tag demo
+```
+
+它只依赖 starlette —— 那本来就是 hub 的依赖，所以**不需要额外安装任何东西**。
 """
 
 from __future__ import annotations

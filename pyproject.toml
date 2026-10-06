@@ -34,8 +34,9 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 a2a-hub = "hub:main"
 
-[project.urls]
-Homepage = "https://github.com/your-org/a2a-hub"
+# 说明：这里刻意**不放** [project.urls]。
+# 原来写的是占位符 https://github.com/your-org/a2a-hub —— 一个指向不存在仓库的
+# URL 比没有更糟：有人会去点。等仓库真的推上去之后再补。
 
 [build-system]
 requires = ["setuptools>=68"]

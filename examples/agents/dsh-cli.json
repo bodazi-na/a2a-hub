@@ -1,0 +1,8 @@
+{
+  "_comment": "示例：把本机的 CLI 工具注册成 agent。把 command 换成你机器上的启动器路径。",
+  "adapter": "DshCLI",
+  "options": {
+    "command": ["<DSH_HOME>\\resources\\runtime\\cli\\bin\\dsh.cmd"],
+    "timeout": 300
+  }
+}

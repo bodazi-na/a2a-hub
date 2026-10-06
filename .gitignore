@@ -1,7 +1,10 @@
 # ---- 运行时数据（不进仓库）----
-data/
-workspace/
-agents/
+# **必须锚定到仓库根**（前导 `/`）：`agents/` 这种写法会匹配**任意层级**下
+# 名叫 agents 的目录，于是把 `examples/agents/`（示例配置，该进仓库）
+# 一起忽略了 —— 陌生人 clone 下来会一个示例都拿不到。
+/agents/
+/data/
+/workspace/
 *.db
 *.db-wal
 *.db-shm

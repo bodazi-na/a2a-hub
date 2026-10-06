@@ -525,4 +525,8 @@ python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑�
   别指望前两个。
 - **`hub → WorkBuddy` 这条没打通**，是设计边界不是缺陷：对方只暴露工具集、
   没有任务级入口。反方向（WorkBuddy → hub）是通的。
+- **它是个服务，不是一个 import 进去用的库**。发行名叫 `a2a-hub`，可导入的顶层模块是
+  `hub` / `core` / `adapters` / `probes` / `mcp_facade`。`core` 和 `adapters`
+  这种通用名会占据 site-packages 的顶层命名空间 —— 如果你要把它当库用，
+  建议装进独立的虚拟环境（README 的快速开始就是这么做的）。
 - **尚未做**：CI 只跑单元级 + 平台级；无 PyPI 发布；无 Docker。

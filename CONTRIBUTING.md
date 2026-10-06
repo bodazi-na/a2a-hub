@@ -123,6 +123,37 @@ git status --short               # 确认没有把 data/ workspace/ agents/ 带�
 **修 bug 必须带回归测试。** 一个能复现原问题的测试，比一句「已修复」有价值得多 ——
 它同时锁住了「这个问题不会再回来」。
 
+## 常见环境问题
+
+**`pip install -e .` 报 `PermissionError: [WinError 5]` 且路径指向某个不相干的目录**
+
+pip 会扫 `sys.path` 找 legacy editable 安装，而 venv 可能继承了 `PYTHONPATH`
+（比如宿主 IDE / 打包器注入的路径），那个路径不可读时就炸在这里 ——
+报错信息和「装这个包」毫无关系，很容易误判成包有问题。
+
+```bash
+# 先看看是不是这个原因
+python -c "import os; print(os.environ.get('PYTHONPATH'))"
+# 清掉再装
+PYTHONPATH= python -m pip install -e .          # Windows PowerShell: $env:PYTHONPATH=$null
+```
+
+**`Start-Process` 报「字典中的关键字:Path 所添加的关键字:PATH」**
+
+PowerShell 5.1 在环境变量里同时存在 `Path` 与 `PATH` 时的已知问题。
+改用 .NET 的 `[System.Diagnostics.Process]::Start()`，或直接
+`cmd /c start`。
+
+**写了 `.ps1` 脚本但 PowerShell 报一堆语法错误**
+
+PS 5.1 按系统代码页（中文 Windows 是 GBK）解码**无 BOM 的 UTF-8** 文件，
+中文注释会变成乱码并破坏语法。两条路：存成 **UTF-8 with BOM**，
+或者**脚本内容全用 ASCII**。
+
+**Bash 工具突然报 `ENOSPC: no space left on device`**
+
+磁盘满了。先 `df -h` 看，再看 `%TEMP%` 所在盘。
+
 ## 不要提交的东西
 
 `.gitignore` 已经排除了 `data/` `workspace/` `agents/` `__pycache__/`，

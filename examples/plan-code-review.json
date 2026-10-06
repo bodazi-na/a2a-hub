@@ -1,0 +1,26 @@
+[
+  {
+    "id": "conc",
+    "agent": "codex-cli",
+    "timeout": 600,
+    "prompt": "你是并发与状态机审查员，只审一个维度：**并发控制与任务取消语义**。\n\n先读这两个文件（相对你当前工作目录）：\n- review-input/hub_app.py\n- review-input/orchestrator.py\n\n重点看：\n1. Hub._running 的登记与注销时机 —— 有没有「登记前就被取消」或「异常路径漏注销」的窗口\n2. update_task(only_from=...) 的条件更新，是否真的堵住了终态被覆盖\n3. asyncio.CancelledError 的捕获路径（它是 BaseException 子类，except Exception 抓不到）\n4. _context_lock(context_id, agent) 的粒度：会不会把并行扇出意外串行化\n5. _semaphore 的作用域与上限，是否存在跨请求泄漏\n6. 异步派发路径 _execute 与同步路径 _send_message 的语义差异\n\n输出格式，每条一行：\n`[P0|P1|P2] 行号或函数名 | 问题（一句话） | 修复建议（一句话）`\n\n硬要求：\n- 每条必须能指到具体行号或函数名；指不到的不要写\n- 不确定的标注「待确认」，不要编造\n- 不要写「建议加日志」「建议加注释」这类无信息量的话\n- 不要复述代码，不要写开场白和总结\n\n最后：**优先**用 Write 工具把完整发现写入 review/conc.md；如果沙箱拒绝写入，不要重试、不要换命令绕，直接在回复里给出完整 markdown 即可。你的回复内容本身就是交付物。"
+  },
+  {
+    "id": "persist",
+    "agent": "qoder-cli",
+    "timeout": 600,
+    "prompt": "你是持久化与事务审查员，只审一个维度：**SQLite 持久化、事务与状态一致性**。\n\n先读这两个文件（相对你当前工作目录）：\n- review-input/store.py\n- review-input/hub_app.py\n\n重点看：\n1. schema 迁移的幂等性与语句顺序（索引建在列之前会 no such column）\n2. add_message 的序号分配是否真的在事务里，并发下会不会重号\n3. BEGIN IMMEDIATE 与重试逻辑：重试上限、退避策略、耗尽后的行为\n4. WAL 模式下的读写一致性，以及 JSON 序列化往返是否会丢字段\n5. update_task 的 only_from 条件与 metadata 合并是否原子\n6. 有没有「先写库再校验」的顺序错误（参数校验必须在落库之前）\n\n输出格式，每条一行：\n`[P0|P1|P2] 行号或函数名 | 问题（一句话） | 修复建议（一句话）`\n\n硬要求：\n- 每条必须能指到具体行号或函数名；指不到的不要写\n- 不确定的标注「待确认」，不要编造\n- 不要写「建议加日志」「建议加注释」这类无信息量的话\n- 不要复述代码，不要写开场白和总结\n\n最后用 Write 工具把完整发现写入 review/persist.md，然后只回复那份 markdown 内容本身。"
+  },
+  {
+    "id": "subproc",
+    "agent": "claude-cli",
+    "timeout": 600,
+    "prompt": "你是 Windows 子进程管理审查员，只审一个维度：**子进程生命周期、管道与超时**。\n\n先读这三个文件（相对你当前工作目录）：\n- review-input/cli.py\n- review-input/a2a_http.py\n- review-input/base.py\n\n重点看：\n1. .cmd 是否用 cmd.exe /c 包裹；argv 拼接有没有转义或注入风险\n2. stdin=PIPE 的写入与 close 时机，会不会造成子进程挂死\n3. _kill 用 taskkill /T /F 杀进程树的可靠性：进程已退出 / PID 复用 / 权限不足各是什么表现\n4. deadline 的建立时机（应从调用开始算，而不是从读流开始）\n5. STREAM_LIMIT 8MB 的截断行为：截断后是明确报错还是静默丢数据\n6. stdout 混入非 JSON 文本时按行过滤的鲁棒性（多行 JSON、超大单行）\n7. a2a_http 的 trust_env=False 是否覆盖所有出口，AsyncClient 生命周期会不会泄漏连接\n\n输出格式，每条一行：\n`[P0|P1|P2] 行号或函数名 | 问题（一句话） | 修复建议（一句话）`\n\n硬要求：\n- 每条必须能指到具体行号或函数名；指不到的不要写\n- 不确定的标注「待确认」，不要编造\n- 不要写「建议加日志」「建议加注释」这类无信息量的话\n- 不要复述代码，不要写开场白和总结\n\n最后用 Write 工具把完整发现写入 review/subproc.md，然后只回复那份 markdown 内容本身。"
+  },
+  {
+    "id": "merge",
+    "agent": "dsh-cli",
+    "timeout": 600,
+    "prompt": "你是整改清单汇总员。下面有三份独立的代码审查结果，来自三个不同的审查员，覆盖同一套代码的不同维度。\n\n=== 审查员 A：并发与取消语义 ===\n{{steps.conc}}\n\n=== 审查员 B：持久化与事务 ===\n{{steps.persist}}\n\n=== 审查员 C：Windows 子进程管理 ===\n{{steps.subproc}}\n\n请合并成一份整改清单：\n\n1. **去重**：同一处代码被多人提到（哪怕措辞不同）只保留一条，标注「多源命中」——多源命中是可信度最高的信号，单独排在最前。\n2. **按严重度分层**：P0 / P1 / P2 三档，每档内按改动成本从低到高排。\n3. **存疑项**：如果两人对同一处给出互相矛盾的建议，单列一节写清分歧点，不要自己拍板。\n4. **剔除噪声**：删掉没有具体行号或函数名的条目，以及「建议加日志/注释」这类无信息量条目，并在末尾说明删了几条。\n5. **不要新增**三份材料里没有的问题。你的职责是合并，不是再审一遍。\n\n输出结构：\n# a2a-hub 代码审查整改清单\n## 一、多源命中（最高优先级）\n## 二、P0\n## 三、P1\n## 四、P2\n## 五、存疑项\n## 六、统计\n\n最后用 Write 工具把它写入 review/FINAL.md，然后只回复这份 markdown 内容本身。"
+  }
+]

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -203,7 +204,11 @@ class Orchestrator:
         infer_dependencies(steps)
         layers = topo_layers(steps)
         by_id = {s.id: s for s in steps}
-        plan_id = plan_id or f"plan-{abs(hash(tuple(s.id for s in steps)))}"
+        # 缺省 planId 用 uuid，**不要用 `abs(hash(...))`**：同一进程里
+        # 「step id 列表相同」的两个并发 plan 会算出同一个 planId，
+        # `list_plan_tasks` 就把两次运行混成一份审计（P2-1）。
+        # 幂等该由调用方显式传 planId 负责，不由缺省值兜。
+        plan_id = plan_id or f"plan-{uuid.uuid4().hex[:12]}"
         results: dict[str, StepResult] = {}
         aborted = False
 

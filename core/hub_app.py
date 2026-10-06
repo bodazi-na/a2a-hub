@@ -584,8 +584,12 @@ class Hub:
         try:
             await bg
         except asyncio.CancelledError:
-            # 调用方取消了等待；任务本身已在 _execute 里被结算成 canceled
-            pass
+            # 调用方取消：**必须把取消转嫁给 bg**。`await bg` 本身不会把取消传下去，
+            # 原来那版只 `pass` 掉，后果是「调用方以为取消了、任务其实在后台跑完」，
+            # 而且已取消的请求还沿正常路径返回了响应（P1-4）。
+            bg.cancel()
+            await asyncio.gather(bg, return_exceptions=True)
+            raise
         return {"task": self._task_payload(task_id)}
 
     async def dispatch_task(
@@ -694,6 +698,10 @@ class Hub:
 
         终态写入一律带 `only_from`：取消和完成可能并发，
         谁先到谁生效，后到的不许覆盖（A2A-01）。
+
+        **整段（含取锁与结算）都在同一个保护块内**，任何异常路径都会落终态 ——
+        否则任务会永远停在活跃态：有活跃态、无 worker、无终态，
+        调用方只能一直等，而 `_running` 早已被 done_callback 清掉（M4）。
         """
         # 「真正开始执行」的时刻。**与 created_at 区分开**：编排层会预先为每个
         # step 落占位任务，记录在 plan 开始那一刻就诞生了，但这一层可能几分钟后
@@ -702,14 +710,33 @@ class Hub:
         self.store.update_task(task_id, started=True, only_from=ACTIVE_STATES)
 
         lock = self._context_lock(context_id, record.name) if context_id else None
-        if lock is not None:
-            await lock.acquire()
+        acquired = False
         try:
+            # 取锁也在保护块内 —— 在这里被取消同样要落终态（M4）
+            if lock is not None:
+                await lock.acquire()
+                acquired = True
+
             async with self._semaphore():
-                self.store.update_task(
+                # 抢状态：**只有状态确实归我们了，才往下游派活**。
+                # 前置条件必须是 ("submitted","working")：异步路径已先把状态置成
+                # working，只认 submitted 的话这个更新必然 no-op，于是「落库 working」
+                # 到「取锁」之间到达的取消拦不住下游 —— 会派活、产生真实副作用
+                # （写盘、烧额度），却永远不落库（M3）。
+                claimed = self.store.update_task(
                     task_id, agent=record.name, state="working",
-                    only_from=("submitted",),
+                    only_from=("submitted", "working"),
                 )
+                if not (claimed or {}).get("_updated"):
+                    self.store.add_message(
+                        task_id, role="agent", kind="status",
+                        content=[{"text": (
+                            f"skipped: 任务已进入终态 "
+                            f"{(claimed or {}).get('state')}，未派发给 {record.name}"
+                        )}],
+                    )
+                    return
+
                 self.store.add_message(
                     task_id, role="agent", kind="status",
                     content=[{"text": f"dispatched to {record.name}"}],
@@ -729,6 +756,12 @@ class Hub:
                     self.store.set_context_session(
                         context_id, record.name, result.session_id
                     )
+
+            # 过程回传 + 终态 + 产物：**必须在同一个保护块内**。
+            # 放在 try 之外的话，add_message / add_artifact 抛异常
+            # （database is locked、metadata 不可序列化…）会直接冒泡，
+            # 任务就永远停在 working 了（M4）。
+            await self._settle_result(task_id, record, result)
         except asyncio.CancelledError:
             self.store.add_message(task_id, role="agent", kind="status",
                                    content=[{"text": "canceled by caller"}])
@@ -737,15 +770,53 @@ class Hub:
                                    only_from=ACTIVE_STATES)
             raise
         except Exception as exc:  # noqa: BLE001
-            self.store.update_task(task_id, state="failed",
-                                   error=f"{type(exc).__name__}: {exc}",
-                                   finished=True, only_from=ACTIVE_STATES)
-            return
+            detail = f"{type(exc).__name__}: {exc}"
+            settled = self.store.update_task(
+                task_id, state="failed", error=detail, finished=True,
+                only_from=ACTIVE_STATES,
+            )
+            if not (settled or {}).get("_updated"):
+                # 状态已经是终态（我们没抢到，多半是被取消了）—— 不能覆盖，
+                # 但也不能把这次失败静默吞掉：记一条消息让审计看得见（P1-3）
+                self.store.add_message(
+                    task_id, role="agent", kind="error",
+                    content=[{"text": f"结算阶段出错，但任务已由其它路径结算：{detail}"}],
+                )
         finally:
-            if lock is not None:
+            # **只在确实拿到了锁时才释放**。acquire() 被取消时锁并未归我们，
+            # 无条件 release() 会抛 "Lock is not acquired"，更糟的是——
+            # 这把锁若正被别人持有，误释放会直接破坏互斥。
+            if acquired and lock is not None:
                 lock.release()
 
-        # 过程回传落库
+    async def _settle_result(self, task_id: str, record, result: Any) -> None:
+        """落终态与产物。
+
+        **顺序是有意的**：先抢终态（由 `only_from` 裁决谁说了算），抢到了才写产物。
+        反过来会留下「任务已被取消、却带着完整 response artifact」的矛盾记录 ——
+        那是「假成功」的另一种形态，调用方会以为活干完了（P2-9）。
+
+        代价是：若产物写入失败，会出现「completed 但没有 artifact」。
+        这种情况由调用方的 except 分支记一条 error 消息，至少不会静默 ——
+        而「已取消却有交付物」是会误导决策的假象，两者不可兼得时选前者。
+        """
+        final = self.store.update_task(
+            task_id,
+            state="completed" if result.ok else "failed",
+            error=None if result.ok else (result.error or "unknown failure"),
+            finished=True,
+            only_from=ACTIVE_STATES,
+        )
+        if not (final or {}).get("_updated"):
+            self.store.add_message(
+                task_id, role="agent", kind="status",
+                content=[{"text": (
+                    f"discarded: 任务已由其它路径结算为 "
+                    f"{(final or {}).get('state')}，本次结果不落库"
+                )}],
+            )
+            return
+
         for event in result.events:
             self.store.add_message(
                 task_id, role="agent", kind=event.kind,
@@ -753,7 +824,6 @@ class Hub:
                 metadata=event.metadata,
             )
 
-        # 终态 + artifact
         if result.ok:
             self.store.add_artifact(
                 task_id, name="response",
@@ -765,8 +835,6 @@ class Hub:
                     "agent": record.name,
                 },
             )
-            self.store.update_task(task_id, state="completed", finished=True,
-                                   only_from=ACTIVE_STATES)
         else:
             self.store.update_task(task_id, state="failed",
                                    error=result.error or "unknown failure",
@@ -952,14 +1020,18 @@ class Hub:
                 pass
             # _execute 内部已把状态置为 canceled，这里不重复写
 
-        # 兜底：任务处于活跃态但没在跑（例如进程重启后遗留的孤儿任务）
-        current = self.store.get_task(task_id)
-        if current and current["state"] in ACTIVE_STATES:
+        # 兜底：任务处于活跃态但没在跑（例如进程重启后遗留的孤儿任务）。
+        # **先做带 only_from 的状态更新，确认成功后再补消息** —— 反过来的话，
+        # 任务若恰好在此期间跑完，就会往一个 completed 任务上追加「已取消」消息
+        # 而状态没变，审计自相矛盾（P2-7）。这条 UPDATE 的 WHERE 本身
+        # 就完成了「是不是活跃态」的判断，不需要再先 get_task 一次。
+        settled = self.store.update_task(
+            task_id, state="canceled", error="canceled: no active worker",
+            finished=True, only_from=ACTIVE_STATES,
+        )
+        if (settled or {}).get("_updated"):
             self.store.add_message(task_id, role="agent", kind="status",
                                    content=[{"text": "canceled (no active worker)"}])
-            self.store.update_task(task_id, state="canceled",
-                                   error="canceled: no active worker",
-                                   finished=True, only_from=ACTIVE_STATES)
         return self._task_payload(task_id)
 
     # ------------------------------------------------------------------

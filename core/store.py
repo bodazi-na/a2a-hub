@@ -56,7 +56,10 @@ def new_id() -> str:
 def _dumps(value: Any) -> str | None:
     if value is None:
         return None
-    return json.dumps(value, ensure_ascii=False)
+    # `default=str` 是兜底：下游传来的 metadata 里可能出现 datetime / 自定义对象。
+    # 没有它，json.dumps 抛 TypeError，而 add_message 的 except 只认 sqlite3 的
+    # 两个异常 —— 异常会带着**未提交的事务**冒泡出去（M1）。
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _loads(value: Any, default: Any = None) -> Any:
@@ -516,6 +519,17 @@ class Store:
                     raise
                 time.sleep(0.01 * (attempt + 1))
             except sqlite3.OperationalError:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            except BaseException:
+                # 兜底回滚：任何其它异常（`_dumps` 的 TypeError、KeyboardInterrupt…）
+                # 都必须先 ROLLBACK 再抛。否则这条连接会卡在未提交的事务里，
+                # 之后所有写都落在同一事务中永不提交，下一次 BEGIN IMMEDIATE
+                # 还会以 "cannot start a transaction within a transaction" 失败 ——
+                # 一次脏数据毒化后续全部请求（M1）。
                 try:
                     self._conn.execute("ROLLBACK")
                 except sqlite3.OperationalError:

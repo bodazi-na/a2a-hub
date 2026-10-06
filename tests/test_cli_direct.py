@@ -34,17 +34,44 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from adapters.base import HEALTH_OK                              # noqa: E402
 from adapters.cli import ClaudeCLI, CodexCLI, DshCLI, QoderCLI  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _local_config(agent_file: str, key: str = "command"):
+    """从本机的 `agents/<name>.json` 读一项配置（读不到返回 None）。
+
+    为什么值得读它：`agents/` 是**本机配置**（不进仓库），里面存的才是这台机器上
+    真正能用的路径。实测踩过 —— 本机 PATH 上有个同名的**空壳** `dsh.cmd`
+    （打印 "Harness CLI not found" 后退出码 1），真正能用的在别的路径；
+    而 hub 自己的 `agents/dsh-cli.json` 里写的正是后者。
+
+    优先级：环境变量 > 本机 agents 配置 > 内置默认值。
+    """
+    import json
+
+    try:
+        with open(os.path.join(ROOT, "agents", agent_file), encoding="utf-8") as fh:
+            spec = json.load(fh)
+        value = (spec.get("options") or {}).get(key)
+        return value or None
+    except (OSError, ValueError):
+        return None
+
 
 # 默认值从环境推导；**不要把某个人的用户名写进仓库**
 NPM = os.environ.get("NPM_GLOBAL_BIN") or os.path.join(
     os.environ.get("APPDATA", ""), "npm"
 )
-# 空则用裸名，交给适配器的 PATH 解析（见 adapters/cli.py 的 _argv）
-DSH_LAUNCHER = os.environ.get("DSH_LAUNCHER") or "dsh"
+# 环境变量 > 本机 agents 配置 > 裸名（交给适配器按 PATH 解析）
+DSH_LAUNCHER = (
+    os.environ.get("DSH_LAUNCHER")
+    or (_local_config("dsh-cli.json") or ["dsh"])[0]
+)
 # Qoder 的 -m 必须传 modelID（UUID）；传显示名会静默回退到内置模型
-QODER_MODEL = os.environ.get("QODER_MODEL", "")
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+QODER_MODEL = os.environ.get("QODER_MODEL") or _local_config("qoder-cli.json", "model") or ""
 PAT_FILE = os.environ.get("QODER_PAT_FILE") or os.path.join(
     os.path.dirname(ROOT), ".qoder_pat"
 )
@@ -100,9 +127,23 @@ async def main() -> int:
         print("  用环境变量指定路径（见本文件顶部说明），或确认它已装好并在 PATH 上。")
         return 0
 
+    # 启动器存在但不可用，也要**明确跳过**。
+    # 实测踩过：本机 PATH 上有个同名的**空壳** `dsh.cmd`（会打印
+    # "Harness CLI not found" 然后退出码 1），而真正能用的在别的路径。
+    # 这时 probe 判为 down 是**正确行为** —— 是本机配置问题，不是适配器缺陷，
+    # 所以不该报 FAIL；但也不能悄悄跳过，要把解析到的路径打出来。
+    health = await adapter.probe()
+    if health != HEALTH_OK:
+        print(f"SKIP（未测试）：{name} 的启动器存在但不可用（probe={health}）。")
+        print(f"  解析到的 command = {adapter.command}")
+        print("  常见原因：PATH 上有个同名的空壳启动器，真正能用的在别的路径。")
+        print("  用环境变量指定真实路径后重跑，例如：")
+        print("    export DSH_LAUNCHER='D:/path/to/real/dsh.cmd'")
+        return 0
+
     print(f"===== {name} =====")
     print("detect :", adapter.detect())
-    print("probe  :", await adapter.probe())
+    print("probe  :", health)
 
     print("\n--- 第 1 轮：记住一个数字 ---")
     first = await adapter.call("Remember the code 7391. Reply with exactly: SAVED")

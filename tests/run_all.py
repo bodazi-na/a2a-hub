@@ -1,0 +1,105 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""统一跑自检脚本，并按「是否需要本机环境」分组。
+
+为什么要分组
+------------
+这些自检脚本不是同一种东西：
+
+- **单元级**：用内存 Store + 假适配器，不碰真实 CLI / 网络 / 系统命令。
+  → 任何机器上都能跑，**CI 里必须全绿**。它们验证的是 core 的逻辑。
+- **集成级**：要真实 CLI、Windows 进程命令、或 hub 正在运行。
+  → 只在开发机上跑。它们验证的是**适配器与本机工具的对接**。
+
+这条分界线恰好就是「薄核心 / 厚适配器」的边界：
+单元级全绿 == 核心确实与平台无关。
+
+用法
+----
+    python tests/run_all.py             # 只跑单元级（CI 用这个）
+    python tests/run_all.py --all       # 单元 + 集成
+    python tests/run_all.py --list      # 只列分组
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PY = sys.executable
+
+# 单元级：内存 Store + 假适配器 / 自建假下游，无外部依赖
+UNIT = [
+    ("test_cancel_semantics", "取消语义（假适配器）"),
+    ("test_p2_fixes", "批次 2 修复（内存 Store）"),
+    ("test_adapter_p2", "适配器修复（自建假下游）"),
+    ("test_isolation", "隔离（假适配器，不执行 CLI）"),
+]
+
+# 集成级：需要真实 CLI / 系统命令 / hub 在跑
+INTEGRATION = [
+    ("test_cli_lifecycle", "CLI 生命周期（需 Windows tasklist/taskkill）"),
+    ("test_kill_tree", "进程树杀死（需 taskkill）"),
+    ("test_cli_direct", "CLI 直连（需真实 CLI，逐个指定）"),
+    ("test_async_cancel", "异步取消（需 hub 在跑）"),
+    ("test_p1_fixes", "P1 修复（需 hub 在跑）"),
+    ("test_mcp_facade", "MCP facade（需 hub 在跑）"),
+]
+
+
+def run_one(name: str) -> tuple[bool, str]:
+    path = os.path.join(ROOT, "tests", f"{name}.py")
+    if not os.path.exists(path):
+        return False, "脚本不存在"
+    proc = subprocess.run(
+        [PY, path], cwd=ROOT, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=600,
+    )
+    tail = (proc.stdout or "").strip().splitlines()
+    summary = next((l for l in reversed(tail) if "RESULT" in l or "汇总" in l), "")
+    return proc.returncode == 0, summary or f"exit={proc.returncode}"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--all", action="store_true", help="连集成级一起跑")
+    ap.add_argument("--list", action="store_true", help="只列分组")
+    args = ap.parse_args()
+
+    if args.list:
+        print("单元级（CI 可跑，无外部依赖）:")
+        for n, d in UNIT:
+            print(f"  {n:<24} {d}")
+        print("\n集成级（需本机环境）:")
+        for n, d in INTEGRATION:
+            print(f"  {n:<24} {d}")
+        return 0
+
+    groups = [("单元级", UNIT)]
+    if args.all:
+        groups.append(("集成级", INTEGRATION))
+
+    failures: list[str] = []
+    for title, items in groups:
+        print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
+        for name, desc in items:
+            ok, note = run_one(name)
+            mark = "PASS" if ok else "FAIL"
+            print(f"  [{mark}] {name:<24} {desc}")
+            if not ok:
+                print(f"         {note[:100]}")
+                failures.append(name)
+
+    total = sum(len(items) for _, items in groups)
+    print(f"\n{'=' * 60}")
+    print(f"合计 {total} 项，失败 {len(failures)} 项")
+    if failures:
+        print("失败:", ", ".join(failures))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

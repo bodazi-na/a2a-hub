@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 单元级自检：用内存 Store + 假适配器，不碰真实 CLI / 网络 / 系统命令。
+  # 这一组全绿就等于证明「core 确实与平台无关」——
+  # 它是「薄核心 + 厚适配器」这条架构约束的自动验证器。
+  unit:
+    name: unit (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 安装（验证 pyproject 可用）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: 跑单元级自检
+        run: python tests/run_all.py
+
+  # 可安装性：单独验证 MCP facade 这个可选依赖能装上
+  mcp-facade:
+    name: mcp facade 可安装
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 装 mcp 可选依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[mcp]"
+      - name: 验证 facade 可导入且工具注册完整
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".")
+          from mcp_facade.server import server
+          tools = {t.name for t in server._tool_manager.list_tools()}
+          expected = {"hub_status","hub_agents","hub_send","hub_plan","hub_trace","hub_tasks"}
+          missing = expected - tools
+          print("tools:", sorted(tools))
+          if missing:
+              print("缺少工具:", missing)
+              sys.exit(1)
+          print("OK")
+          PY
+
+# 说明：集成级自检（test_cli_direct / test_cli_lifecycle / test_kill_tree /
+# test_async_cancel / test_p1_fixes / test_mcp_facade）**不在 CI 里跑** ——
+# 它们需要真实 CLI、Windows 进程命令、或 hub 正在运行。
+# 那验证的是「适配器与本机工具的对接」，只能在开发机上跑：
+#     python tests/run_all.py --all

@@ -53,7 +53,22 @@ KILL_GRACE_SECONDS = 5.0
 
 # asyncio 子进程流单行上限。默认 64KB 对「工具输出塞进一行 JSON」的场景太小，
 # 一超就抛异常（A2A-03）。
+#
+# 注意：这是 StreamReader 的**硬上限**，不是「超过就截断」——
+# `readline()` 单行超限会抛 `LimitOverrunError`，整个 call 被判失败并 kill 进程树，
+# 一条超大工具输出就能毁掉整轮（P2-17）。所以 `_read_lines` 不走 readline，
+# 改成按块读 + 自己切行，这个值只作为「切行缓冲的上限」使用。
 STREAM_LIMIT = 8 * 1024 * 1024
+
+# 每次从流里读多少字节
+READ_CHUNK = 256 * 1024
+# 超长行被截断时保留的前缀（够诊断即可，不做语义）
+KEEP_LINE_BYTES = 64 * 1024
+# 非 JSON 噪声最多留几行（只用于诊断，**不能无限增长**，P2-5）
+MAX_NOISE_LINES = 200
+# 跨行 JSON 重组的上限：攒到这么多还拼不出来就放弃（P2-24）
+MAX_JOIN_LINES = 500
+MAX_JOIN_BYTES = 2 * 1024 * 1024
 
 # argv 里允许出现的字符。
 #
@@ -282,7 +297,14 @@ class CLIAdapter(Adapter):
         raise NotImplementedError
 
     def new_state(self) -> dict[str, Any]:
-        return {"noise": [], "usage": {}, "session_id": None}
+        return {
+            "noise": [],        # 最近若干条非 JSON 行（诊断用，有上限）
+            "noise_total": 0,   # 非 JSON 行总数
+            "oversized": 0,     # 被截断的超长行数
+            "unparsed": 0,      # 以 `{` 开头但始终拼不成 JSON 的行数
+            "usage": {},
+            "session_id": None,
+        }
 
     # ------------------------------------------------------------------
     # 探测
@@ -487,7 +509,7 @@ class CLIAdapter(Adapter):
     async def _consume(
         self, proc: asyncio.subprocess.Process, state: dict[str, Any], events: list[Event]
     ) -> None:
-        """逐行读 stdout；stderr 单独收尾（用于失败诊断）。"""
+        """读 stdout 的事件流；stderr 单独收尾（用于失败诊断）。"""
         assert proc.stdout is not None
 
         async def drain_stderr() -> None:
@@ -500,18 +522,7 @@ class CLIAdapter(Adapter):
 
         stderr_task = asyncio.create_task(drain_stderr())
         try:
-            async for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                obj = self._try_json(line)
-                if obj is None:
-                    # CLI 会在 stdout 混入非 JSON 提示（Qoder 实测有），
-                    # 记下来备查，但不当作事件。
-                    state["noise"].append(line)
-                    continue
-                for event in self.parse_line(obj, state) or []:
-                    events.append(event)
+            await self._read_lines(proc.stdout, state, events)
             await proc.wait()
         finally:
             stderr_task.cancel()
@@ -519,6 +530,115 @@ class CLIAdapter(Adapter):
                 await stderr_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+
+    async def _read_lines(
+        self, stream: asyncio.StreamReader, state: dict[str, Any],
+        events: list[Event],
+    ) -> None:
+        """按块读、自己切行 —— 刻意**不走 `readline()`**。
+
+        三件事必须处理好，否则「一行坏数据就能毁掉整轮」：
+
+        1. **单行超限要截断，不能整轮失败**（P2-17）
+           `limit=` 是 StreamReader 的硬上限：单行超过它，`readline()` 抛
+           `LimitOverrunError`，整个 call 被判失败并 kill 进程树 ——
+           一条超大工具输出就能毁掉一轮。这里用 `read()`（不受该上限约束）
+           自己切行，超长行**截断保留前缀**并计数，轮次继续。
+
+        2. **非 JSON 行要限量**（P2-5）
+           原来 `state["noise"]` 无限 append，CLI 刷屏时内存无界增长。
+           现在只留最近 `MAX_NOISE_LINES` 行，总量另用计数器记。
+
+        3. **跨行 JSON 要能重组**（P2-24）
+           逐行 `json.loads` 遇到 pretty-printed JSON 会把每一行都当噪声
+           **静默丢掉**。现在对 `{` 开头但单行解析不出的行做缓冲聚合；
+           聚合失败则**单独计数**（`unparsed`），不再混进普通噪声里无声无息。
+        """
+        buf = bytearray()
+        skipping = False          # 正在丢弃一条超长行的剩余部分
+        pending: list[str] = []   # 跨行 JSON 重组缓冲
+        pending_bytes = 0
+
+        def emit(obj: dict[str, Any]) -> None:
+            for event in self.parse_line(obj, state) or []:
+                events.append(event)
+
+        def note_noise(line: str) -> None:
+            state["noise_total"] += 1
+            if len(state["noise"]) < MAX_NOISE_LINES:
+                state["noise"].append(line[:500])
+
+        def feed(line: str) -> None:
+            nonlocal pending_bytes
+            if not line.strip():
+                return
+
+            # 正在重组跨行 JSON
+            if pending:
+                pending.append(line)
+                pending_bytes += len(line)
+                # 只在「看起来收尾了」时才尝试解析 —— 否则每来一行都要
+                # 把整个缓冲重新 loads 一遍，大对象会变成 O(n²)
+                if line.rstrip().endswith(("}", "]")):
+                    obj = self._try_json("\n".join(pending))
+                    if obj is not None:
+                        pending.clear()
+                        pending_bytes = 0
+                        emit(obj)
+                        return
+                if len(pending) >= MAX_JOIN_LINES or pending_bytes > MAX_JOIN_BYTES:
+                    state["unparsed"] += len(pending)
+                    pending.clear()
+                    pending_bytes = 0
+                return
+
+            obj = self._try_json(line)
+            if obj is not None:
+                emit(obj)
+                return
+            if line.lstrip().startswith("{"):
+                pending.append(line)
+                pending_bytes = len(line)
+                return
+            note_noise(line)
+
+        while True:
+            chunk = await stream.read(READ_CHUNK)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    if len(buf) > STREAM_LIMIT:
+                        # 超长行：留前缀、丢弃其余、进入跳过模式（P2-17）。
+                        # 截断后的残片**不喂给解析器** —— 它注定解析不出来，
+                        # 喂进去只会污染跨行重组缓冲。
+                        #
+                        # 计数只在「进入跳过模式」那一次做：一条超长行可能
+                        # 跨很多个块，每块都触发一次这个分支，若不加这个判断
+                        # 就会把**一条**行记成好几条（测试抓到过）。
+                        if not skipping:
+                            state["oversized"] += 1
+                            if len(state["noise"]) < MAX_NOISE_LINES:
+                                state["noise"].append(
+                                    buf[:500].decode("utf-8", "replace") + "…[truncated]"
+                                )
+                            skipping = True
+                        buf.clear()
+                    break
+                line = bytes(buf[:nl])
+                del buf[: nl + 1]
+                if skipping:
+                    skipping = False        # 这条超长行的尾巴，丢掉
+                    continue
+                feed(line.decode("utf-8", "replace").strip())
+
+        if buf and not skipping:
+            feed(buf.decode("utf-8", "replace").strip())
+        if pending:
+            # EOF 时还攒着 —— 拼不成，如实计数（P2-24）
+            state["unparsed"] += len(pending)
 
     @staticmethod
     def _try_json(line: str) -> dict[str, Any] | None:
@@ -608,6 +728,20 @@ class CLIAdapter(Adapter):
             problems.append(f"等待进程退出超过 {KILL_GRACE_SECONDS:.0f}s")
 
         return problems
+
+    @staticmethod
+    def _stream_stats(state: dict[str, Any]) -> dict[str, Any]:
+        """把流解析的异常计数带进 metadata。
+
+        这些数字**必须可见** —— 「静默丢数据」是这个适配器最隐蔽的失败模式：
+        任务显示成功，但下游真正说的东西被丢掉了。原来的 `noise` 列表
+        既无限增长（P2-5），又不区分「环境提示」和「拼不出来的 JSON」（P2-24）。
+        """
+        return {
+            "noiseLines": state.get("noise_total", 0),          # 非 JSON 行总数
+            "oversizedLines": state.get("oversized", 0),        # 被截断的超长行
+            "unparsedJsonLines": state.get("unparsed", 0),      # 拼不成 JSON 的行
+        }
 
     def _env(self) -> dict[str, str]:
         env = dict(os.environ)
@@ -732,7 +866,7 @@ class ClaudeStyleCLI(CLIAdapter):
                 "totalCostUsd": result.get("total_cost_usd"),
                 "stopReason": result.get("stop_reason"),
                 "errorCode": result.get("error_code"),
-                "noiseLines": len(state.get("noise") or []),
+                **self._stream_stats(state),
             },
             error=error,
         )
@@ -851,7 +985,7 @@ class DshCLI(CLIAdapter):
             usage=state.get("usage") or {},
             metadata={
                 "turnEndReason": reason,
-                "noiseLines": len(state.get("noise") or []),
+                **self._stream_stats(state),
             },
             error=error,
         )
@@ -967,7 +1101,7 @@ class CodexCLI(CLIAdapter):
             session_id=state.get("session_id"),
             usage=state.get("usage") or {},
             metadata={
-                "noiseLines": len(state.get("noise") or []),
+                **self._stream_stats(state),
                 # Codex 会把「配置项被忽略」之类的提示塞成 error item，
                 # 收在这里备查，不当作任务失败。
                 "warnings": (state.get("warnings") or [])[:3],

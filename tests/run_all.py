@@ -40,6 +40,7 @@ UNIT = [
     ("test_plan_cancel_and_timing", "编排取消 + 计时基准（假适配器）"),
     ("test_state_integrity", "状态机完整性（假适配器）"),
     ("test_subprocess_argv", "argv 白名单与 cmd.exe 包裹（纯逻辑）"),
+    ("test_stream_parsing", "事件流解析：截断/限量/跨行重组（假流）"),
     ("test_p2_fixes", "批次 2 修复（内存 Store）"),
     ("test_adapter_p2", "适配器修复（自建假下游）"),
     ("test_isolation", "隔离（假适配器，不执行 CLI）"),

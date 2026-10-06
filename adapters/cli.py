@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -53,6 +54,173 @@ KILL_GRACE_SECONDS = 5.0
 # asyncio 子进程流单行上限。默认 64KB 对「工具输出塞进一行 JSON」的场景太小，
 # 一超就抛异常（A2A-03）。
 STREAM_LIMIT = 8 * 1024 * 1024
+
+# argv 里允许出现的字符。
+#
+# 为什么必须用白名单（P1-8）
+# --------------------------
+# 本机四个 CLI 里三个是 `.cmd`，Windows 上不能直接 CreateProcess，
+# 必须经 `cmd.exe /c`。而 **cmd.exe 会重新解释命令行**。实测（2026-10-06）：
+#
+#   传入        cmd 解释成        后果
+#   a&b         a                 & 把命令切断 —— `a&calc` 会真的执行 calc
+#   a|b         （管道）          把 b 当命令跑
+#   a>b         （重定向）        输出被吞
+#   a^b         ab                ^ 被当转义符吃掉
+#   a%PATH%b    展开成 PATH 的值  **加引号也拦不住**
+#
+# 前四条可以用引号挡住，最后一条不行 —— cmd 的 `%` 展开不受引号约束，
+# 而 `%` 在 cmd 命令行上**无法可靠转义**（`^%` 无效，`%%` 只在批处理文件里有效）。
+# 所以「转义参数」这条路根本走不通，唯一稳妥的做法是**不让可疑值进入命令行**。
+#
+# 代价：下游若真的返回带空格的 session id，会被拒绝并明确报错。这是刻意的 ——
+# 宁可报错，也不要静默地把命令拆错（静默拆错才是真危险）。
+SAFE_ARG_RE = re.compile(r"^[A-Za-z0-9._:@/+\-]+$")
+
+
+class UnsafeArgError(ValueError):
+    """argv 里出现了会被 cmd.exe 重新解释的值。"""
+
+
+# ---------------------------------------------------------------------------
+# Windows Job Object
+#
+# 为什么需要它（P1-7 + P2-21）
+# ---------------------------
+# 1. `taskkill /PID` 是**按 PID 定位**的。从「检查 returncode」到「执行 taskkill」
+#    之间进程若恰好退出，PID 可能已被复用 —— 于是杀掉一个无关进程（TOCTOU）。
+# 2. taskkill 的返回码与 stderr 原来全被 DEVNULL 掉，权限不足时**静默漏杀**，
+#    孤儿 node 继续烧 token 占 session，而且没有任何信号。
+#
+# Job Object 用**句柄**定位，没有 PID 复用窗口；`TerminateJobObject` 一次干掉
+# 整棵树（包括「直接子进程已退出但孙进程还在」这种情况 —— 这是 taskkill 做不到的）；
+# 再配 `KILL_ON_JOB_CLOSE`，连「hub 自己崩了」也能兜住，不会留下孤儿。
+#
+# 拿不到 job 时（非 Windows、或已被不允许嵌套的受限 job 包住）退回 taskkill，
+# 但**必须检查返回码**，不许再静默。
+# ---------------------------------------------------------------------------
+
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+
+
+class _JobObject:
+    """把一个子进程及其后代收进 Job Object，之后用句柄语义整体终止。"""
+
+    __slots__ = ("handle", "_k32")
+
+    def __init__(self, pid: int) -> None:
+        self.handle: int | None = None
+        self._k32 = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            class _IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                    "ReadOperationCount", "WriteOperationCount",
+                    "OtherOperationCount", "ReadTransferCount",
+                    "WriteTransferCount", "OtherTransferCount")]
+
+            class _BASIC_LIMIT(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                    ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),          # ULONG_PTR
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _EXTENDED_LIMIT(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _BASIC_LIMIT),
+                    ("IoInfo", _IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            handle = k32.CreateJobObjectW(None, None)
+            if not handle:
+                return
+
+            info = _EXTENDED_LIMIT()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                ctypes.byref(info), ctypes.sizeof(info),
+            ):
+                k32.CloseHandle(handle)
+                return
+
+            # 按 PID 拿子进程句柄 —— 只在这一瞬（刚 spawn 完，进程必然还活着），
+            # 之后一律用 job 句柄，不存在 PID 复用问题
+            ph = k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+            if not ph:
+                k32.CloseHandle(handle)
+                return
+            try:
+                if not k32.AssignProcessToJobObject(handle, ph):
+                    k32.CloseHandle(handle)
+                    return
+            finally:
+                k32.CloseHandle(ph)
+
+            self.handle = handle
+            self._k32 = k32
+        except Exception:  # noqa: BLE001
+            # 任何失败都退化成「没有 job」—— 调用方会走 taskkill 兜底
+            self.handle = None
+            self._k32 = None
+
+    @property
+    def ok(self) -> bool:
+        return self.handle is not None
+
+    def terminate(self) -> bool:
+        """终止 job 里**全部**进程。句柄语义，不涉及 PID 复用。"""
+        if not self.handle or self._k32 is None:
+            return False
+        try:
+            return bool(self._k32.TerminateJobObject(self.handle, 1))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def close(self) -> None:
+        """关掉 job 句柄。配 KILL_ON_JOB_CLOSE，残余进程会一起走。"""
+        if not self.handle or self._k32 is None:
+            self.handle = None
+            return
+        try:
+            self._k32.CloseHandle(self.handle)
+        except Exception:  # noqa: BLE001
+            pass
+        self.handle = None
+
+
+def _with_kill_problems(message: str, problems: list[str]) -> str:
+    """把「终止进程树时的失败」拼进错误文案。
+
+    **静默漏杀是这个适配器最危险的失败模式** —— 调用方以为任务停了，
+    实际上孤儿 node 还在烧 token、还占着下游 session（P1-7）。
+    宁可文案丑一点，也要让这件事被看见。
+    """
+    if not problems:
+        return message
+    return (f"{message}；⚠️ 终止子进程树时出错，可能留下了孤儿进程: "
+            + "; ".join(problems))
+
 
 
 @dataclass
@@ -134,11 +302,38 @@ class CLIAdapter(Adapter):
 
         Windows 上 `.cmd` / `.bat` 不能直接被 CreateProcess 执行，
         必须用 `cmd.exe /c` 包一层 —— 本机四个 CLI 里有三个是 .cmd 启动器。
+        加 `/d` 关掉 AutoRun，免得注册表里的 AutoRun 命令混进输出。
+
+        **正因为要经 cmd.exe，每个由下游决定的值都必须先过白名单** ——
+        cmd 会重新解释命令行，而 `%` 展开连引号都拦不住（P1-8，
+        细节见 `SAFE_ARG_RE` 的注释）。
+
+        `command[0]` 若是**不带扩展名的裸命令名**（如 `codex`），得靠 PATH 解析
+        才知道它其实是 `.cmd`。只按字符串判断会漏掉包裹，CreateProcess 于是
+        报「找不到文件 / WinError 193」（P2-14）。
         """
         base = list(self.command)
-        if base and base[0].lower().endswith((".cmd", ".bat")):
-            base = ["cmd.exe", "/c"] + base
-        return base + list(extra)
+        if base:
+            exe = base[0]
+            if not os.path.isabs(exe):
+                from shutil import which
+
+                exe = which(exe) or exe
+            if exe.lower().endswith((".cmd", ".bat")):
+                base = ["cmd.exe", "/d", "/c", exe] + base[1:]
+            else:
+                base = [exe] + base[1:]
+
+        safe: list[str] = []
+        for value in extra:
+            text = str(value)
+            if not SAFE_ARG_RE.match(text):
+                raise UnsafeArgError(
+                    "参数含 cmd.exe 会重新解释的字符，已拒绝执行"
+                    f"（否则命令可能被拆分或注入）: {text!r}"
+                )
+            safe.append(text)
+        return base + safe
 
     async def probe(self) -> str:
         """探活 = 跑一次 `--version`。
@@ -151,6 +346,7 @@ class CLIAdapter(Adapter):
         否则取消路径会静默跳过清理。
         """
         proc: asyncio.subprocess.Process | None = None
+        job: _JobObject | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self._argv("--version"),
@@ -161,16 +357,22 @@ class CLIAdapter(Adapter):
                 env=self._env(),
                 limit=STREAM_LIMIT,
             )
+            # spawn 之后立刻收进 job，越早越好 —— 晚了 cmd.exe 可能已经把
+            # node 孙进程拉起来，那个孙进程就漏在 job 外面了
+            job = _JobObject(proc.pid)
             await asyncio.wait_for(proc.communicate(), timeout=30.0)
             return HEALTH_OK if proc.returncode == 0 else HEALTH_DOWN
         except asyncio.CancelledError:
             if proc is not None:
-                await self._kill(proc)
+                await self._kill(proc, job)
             raise
         except Exception:  # noqa: BLE001
             if proc is not None:
-                await self._kill(proc)
+                await self._kill(proc, job)
             return HEALTH_DOWN
+        finally:
+            if job is not None:
+                job.close()
 
     # ------------------------------------------------------------------
     # 调用
@@ -184,38 +386,59 @@ class CLIAdapter(Adapter):
         session_id: str | None = None,
         timeout: float | None = None,
     ) -> CallResult:
-        argv = self._argv(*self.build_argv(session_id or None))
+        try:
+            argv = self._argv(*self.build_argv(session_id or None))
+        except UnsafeArgError as exc:
+            # 下游给了会被 cmd.exe 重新解释的值 —— 宁可明确失败，
+            # 也不要静默地把命令拆错（P1-8）
+            return CallResult(ok=False, error=str(exc))
+
         events: list[Event] = []
         state = self.new_state()
         # 未显式指定时用适配器自己的配置值 —— 不能替调用方填死一个数，
         # 否则 agents/*.json 里配的 timeout 永远不生效（A2A-13）
         effective_timeout = timeout if timeout is not None else self.default_timeout
 
+        # deadline 在 **spawn 之前** 建立（P2-8）：spawn 本身也可能挂住
+        # （cmd.exe 冷启动、杀软扫描、网络盘），原来那版要等 spawn 返回才起算，
+        # 这段时间完全不受预算约束。
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + effective_timeout
+
+        def remaining() -> float:
+            return max(deadline - loop.time(), 1.0)
+
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                # stdin 既用来传 prompt，也提供输入结束信号（写完就 close）。
-                # 不能用 DEVNULL —— 那样既没数据也没有明确的输入边界，
-                # codex / claude 会一直等（实测让 codex 挂死 4 分半直到超时）。
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.cwd,
-                env=self._env(),
-                # 单行事件可能很长（工具输出被塞进一行 JSON），
-                # 默认 64KB 的流限制会直接抛异常。
-                limit=STREAM_LIMIT,
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *argv,
+                    # stdin 既用来传 prompt，也提供输入结束信号（写完就 close）。
+                    # 不能用 DEVNULL —— 那样既没数据也没有明确的输入边界，
+                    # codex / claude 会一直等（实测让 codex 挂死 4 分半直到超时）。
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.cwd,
+                    env=self._env(),
+                    # 单行事件可能很长（工具输出被塞进一行 JSON），
+                    # 默认 64KB 的流限制会直接抛异常。
+                    limit=STREAM_LIMIT,
+                ),
+                timeout=remaining(),
+            )
+        except asyncio.TimeoutError:
+            return CallResult(
+                ok=False, events=events, timed_out=True,
+                error=f"启动超时：spawn 阶段就用掉了 {effective_timeout:.0f}s 预算",
             )
         except FileNotFoundError:
             return CallResult(ok=False, error=f"可执行文件不存在: {argv[0]}")
         except Exception as exc:  # noqa: BLE001
             return CallResult(ok=False, error=f"启动失败 {type(exc).__name__}: {exc}")
 
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + effective_timeout
-
-        def remaining() -> float:
-            return max(deadline - loop.time(), 1.0)
+        # spawn 之后立刻收进 job，越早越好 —— 晚了 cmd.exe 可能已经把 node
+        # 孙进程拉起来，那个孙进程就漏在 job 外面了（P1-7 / P2-21）
+        job = _JobObject(proc.pid)
 
         try:
             # 写 stdin 也必须在超时保护之内（A2A-02）：
@@ -224,23 +447,27 @@ class CLIAdapter(Adapter):
             await asyncio.wait_for(self._feed_stdin(proc, prompt), timeout=remaining())
             await asyncio.wait_for(self._consume(proc, state, events), timeout=remaining())
         except asyncio.TimeoutError:
-            await self._kill(proc)
+            problems = await self._kill(proc, job)
             return CallResult(
-                ok=False, events=events,
-                error=f"超时 {effective_timeout:.0f}s，已终止子进程树",
+                ok=False, events=events, timed_out=True,
+                error=_with_kill_problems(
+                    f"超时 {effective_timeout:.0f}s，已终止子进程树", problems),
             )
         except asyncio.CancelledError:
             # 取消必须把子进程带走，否则它会变成孤儿继续跑
-            await self._kill(proc)
+            await self._kill(proc, job)
             raise
         except Exception as exc:  # noqa: BLE001
             # A2A-03：任何异常（含流超限、解析错误）都必须回收子进程，
             # 否则它会带着下游会话继续跑，既烧资源又占 session。
-            await self._kill(proc)
+            problems = await self._kill(proc, job)
             return CallResult(
                 ok=False, events=events,
-                error=f"{type(exc).__name__}: {exc}",
+                error=_with_kill_problems(f"{type(exc).__name__}: {exc}", problems),
             )
+        finally:
+            if job is not None:
+                job.close()
 
         stderr_tail = (state.get("stderr_tail") or "").strip()
         outcome = self.finalize(state, proc.returncode or 0)
@@ -323,25 +550,54 @@ class CLIAdapter(Adapter):
                 pass
 
     @staticmethod
-    async def _kill(proc: asyncio.subprocess.Process) -> None:
-        """杀**整棵进程树**。
+    async def _kill(proc: asyncio.subprocess.Process,
+                    job: "_JobObject | None" = None) -> list[str]:
+        """杀**整棵进程树**，并**把失败如实报出来**（不再静默漏杀）。
 
-        直接 `proc.kill()` 在 Windows 上只杀掉 `cmd.exe /c xxx.cmd` 的外壳，
-        底下的 node 孙进程（claude / codex / qoder / dsh 本体）会变成孤儿继续跑 ——
-        既烧 token 又占着 session。本机四个 CLI 里三个是 .cmd 启动器，
-        所以必须走 taskkill /T。
+        为什么要杀树：直接 `proc.kill()` 在 Windows 上只杀掉 `cmd.exe /c xxx.cmd`
+        的外壳，底下的 node 孙进程（claude / codex / qoder / dsh 本体）会变成
+        孤儿继续跑 —— 既烧 token 又占着 session。本机四个 CLI 里三个是 .cmd 启动器。
+
+        三级策略：
+          1. **Job Object**（首选）—— 句柄语义，一次干掉整棵树，
+             且「直接子进程已退出、孙进程还在」这种情况也能收掉；
+             没有「检查 returncode 与终止之间 PID 被复用」的窗口（P2-21）。
+          2. **taskkill /T /F**（兜底）—— **必须看返回码**：权限不足时它会失败，
+             原来把返回码和 stderr 全 DEVNULL 掉，于是静默漏杀（P1-7）。
+          3. `proc.kill()` 最后手段。
+
+        返回**失败说明**的列表（全成功则为空）。调用方把它拼进错误文案 ——
+        用户至少能知道「可能留下了孤儿进程」，而不是一无所知。
         """
+        problems: list[str] = []
+
+        # 1) Job Object：句柄语义。即使直接子进程已退出也要试 ——
+        #    它的后代可能还在 job 里活着，这正是 taskkill 覆盖不到的情况。
+        if job is not None:
+            if job.terminate():
+                return problems
+            problems.append("TerminateJobObject 失败，回退 taskkill")
+
         if proc.returncode is not None:
-            return
+            return problems
+
+        # 2) taskkill 兜底，检查返回码
         try:
             killer = await asyncio.create_subprocess_exec(
                 "taskkill", "/PID", str(proc.pid), "/T", "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            await asyncio.wait_for(killer.wait(), timeout=10.0)
-        except Exception:  # noqa: BLE001
-            pass
+            out, err = await asyncio.wait_for(killer.communicate(), timeout=10.0)
+            if killer.returncode != 0:
+                detail = (err or out or b"").decode("utf-8", "replace").strip()
+                problems.append(
+                    f"taskkill 退出码 {killer.returncode}: {detail[:120] or '(无输出)'}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"taskkill 未能执行: {type(exc).__name__}: {exc}")
+
+        # 3) 最后手段
         try:
             proc.kill()
         except (ProcessLookupError, OSError):
@@ -349,7 +605,9 @@ class CLIAdapter(Adapter):
         try:
             await asyncio.wait_for(proc.wait(), timeout=KILL_GRACE_SECONDS)
         except asyncio.TimeoutError:
-            pass
+            problems.append(f"等待进程退出超过 {KILL_GRACE_SECONDS:.0f}s")
+
+        return problems
 
     def _env(self) -> dict[str, str]:
         env = dict(os.environ)

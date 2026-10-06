@@ -43,7 +43,9 @@ def state_of(payload: dict) -> str:
 
 
 def main() -> int:
-    agent = sys.argv[1] if len(sys.argv) > 1 else "dsh"
+    # 默认节点名要与注册表一致 —— 原来写的是 "dsh"，而注册的是 "dsh-cli"，
+    # 于是这个测试一直以「agent 未注册」失败，白白掩盖了它本该验证的取消路径。
+    agent = sys.argv[1] if len(sys.argv) > 1 else "dsh-cli"
 
     # 1) 异步派发一个明显耗时的任务
     dispatched = rpc("SendMessage", {

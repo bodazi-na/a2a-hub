@@ -7,9 +7,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 单元级自检：用内存 Store + 假适配器，不碰真实 CLI / 网络 / 系统命令。
-  # 这一组全绿就等于证明「core 确实与平台无关」——
-  # 它是「薄核心 + 厚适配器」这条架构约束的自动验证器。
+  # 单元级 + 平台级自检。
+  #   单元级：内存 Store + 假适配器，不碰真实 CLI / 网络 / 系统命令。
+  #           这一组全绿就等于证明「core 确实与平台无关」——
+  #           它是「薄核心 + 厚适配器」这条架构约束的自动验证器。
+  #   平台级：会真的起进程（只用 sys.executable，不依赖外部 CLI），
+  #           验证 Windows 独有的 Job Object。非 Windows 自动跳过。
+  #           放在同一个 job 里跑，是因为 matrix 已经覆盖 windows-latest。
   unit:
     name: unit (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -30,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
-      - name: 跑单元级自检
+      - name: 跑单元级 + 平台级自检
         run: python tests/run_all.py
 
   # 可安装性：单独验证 MCP facade 这个可选依赖能装上

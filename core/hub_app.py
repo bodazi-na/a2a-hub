@@ -751,6 +751,32 @@ class Hub:
                     session_id=session_id,
                     timeout=timeout,
                 )
+                # 续接失败要能自愈。
+                #
+                # 下游的 session 可能已经不存在了（它自己重启、被清理、换了 cwd）。
+                # 此时下游往往只回「退出码非 0」且**没有任何输出**，从错误里根本
+                # 看不出原因；更糟的是这条死映射会被**永久保留** —— 于是这个
+                # contextId 之后每次调用都失败，等于把它彻底弄坏了。
+                #
+                # 处理：清掉映射、不带 session 重试一次。三个条件都满足才做 ——
+                # 用了 session 续接、不是超时、还没重试过。超时说明下游确实跑了
+                # 那么久，重试等于把开销翻倍。
+                if context_id and session_id and not result.ok and not result.timed_out:
+                    self.store.add_message(
+                        task_id, role="agent", kind="status",
+                        content=[{"text": (
+                            f"resume failed with session {session_id}; "
+                            "clearing the mapping and retrying without session"
+                        )}],
+                    )
+                    self.store.set_context_session(context_id, record.name, None)
+                    session_id = None
+                    result = await adapter.call(
+                        prompt,
+                        context_id=context_id or None,
+                        session_id=None,
+                        timeout=timeout,
+                    )
                 # 会话映射的写回也在锁内 —— 出锁即已落库
                 if context_id and result.session_id:
                     self.store.set_context_session(

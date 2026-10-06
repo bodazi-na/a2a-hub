@@ -56,6 +56,10 @@ class CallResult:
     usage: dict[str, Any] = field(default_factory=dict)        # 只放 token 用量
     metadata: dict[str, Any] = field(default_factory=dict)     # 其余下游元信息
     error: str | None = None
+    # 失败是否由「超时」造成。调用方据此决定要不要重试 ——
+    # 超时说明下游确实跑了那么久，重试等于把开销翻倍；
+    # 而「续接的 session 已失效」这类失败通常**秒级**返回，重试是划算的。
+    timed_out: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 

@@ -8,16 +8,19 @@
 
 - **单元级**：用内存 Store + 假适配器，不碰真实 CLI / 网络 / 系统命令。
   → 任何机器上都能跑，**CI 里必须全绿**。它们验证的是 core 的逻辑。
+- **平台级**：会**真的起进程**（但只用 `sys.executable`，不依赖外部 CLI），
+  用来验证 Windows 独有机制（Job Object）。非 Windows 自动跳过并按 PASS 计。
+  → CI 的 windows-latest 那格能跑到它。
 - **集成级**：要真实 CLI、Windows 进程命令、或 hub 正在运行。
   → 只在开发机上跑。它们验证的是**适配器与本机工具的对接**。
 
-这条分界线恰好就是「薄核心 / 厚适配器」的边界：
-单元级全绿 == 核心确实与平台无关。
+单元级那条分界线恰好就是「薄核心 / 厚适配器」的边界：
+单元级全绿 == 核心确实与平台无关。平台级与它分开，是为了不让这条约束失效。
 
 用法
 ----
-    python tests/run_all.py             # 只跑单元级（CI 用这个）
-    python tests/run_all.py --all       # 单元 + 集成
+    python tests/run_all.py             # 单元级 + 平台级（CI 用这个）
+    python tests/run_all.py --all       # 再加集成级
     python tests/run_all.py --list      # 只列分组
 """
 
@@ -36,9 +39,19 @@ UNIT = [
     ("test_cancel_semantics", "取消语义（假适配器）"),
     ("test_plan_cancel_and_timing", "编排取消 + 计时基准（假适配器）"),
     ("test_state_integrity", "状态机完整性（假适配器）"),
+    ("test_subprocess_argv", "argv 白名单与 cmd.exe 包裹（纯逻辑）"),
     ("test_p2_fixes", "批次 2 修复（内存 Store）"),
     ("test_adapter_p2", "适配器修复（自建假下游）"),
     ("test_isolation", "隔离（假适配器，不执行 CLI）"),
+]
+
+# 平台级：会**真的起进程**（用 sys.executable，不依赖任何外部 CLI），
+# 非 Windows 上自行跳过并按 PASS 计 —— 所以 CI 的 windows-latest 那一格能真正跑到它。
+#
+# 为什么不塞进单元级：单元级那条「全绿 == core 确实与平台无关」的约束，
+# 靠的是「不碰真实进程」。把进程测试混进去会让那条约束失效。
+PLATFORM = [
+    ("test_job_object", "Job Object 收进程树（需 Windows，非 Windows 跳过）"),
 ]
 
 # 集成级：需要真实 CLI / 系统命令 / hub 在跑
@@ -75,12 +88,15 @@ def main() -> int:
         print("单元级（CI 可跑，无外部依赖）:")
         for n, d in UNIT:
             print(f"  {n:<24} {d}")
+        print("\n平台级（会起真实进程，非 Windows 自动跳过）:")
+        for n, d in PLATFORM:
+            print(f"  {n:<24} {d}")
         print("\n集成级（需本机环境）:")
         for n, d in INTEGRATION:
             print(f"  {n:<24} {d}")
         return 0
 
-    groups = [("单元级", UNIT)]
+    groups = [("单元级", UNIT), ("平台级", PLATFORM)]
     if args.all:
         groups.append(("集成级", INTEGRATION))
 

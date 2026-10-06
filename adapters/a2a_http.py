@@ -222,7 +222,10 @@ class A2AHttpAdapter(Adapter):
                 "SendMessage", {"message": message}, timeout=remaining()
             )
         except Exception as exc:
-            return CallResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+            return CallResult(
+                ok=False, timed_out=isinstance(exc, httpx.TimeoutException),
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
         task = result.get("task")
         if task is None:
@@ -255,7 +258,9 @@ class A2AHttpAdapter(Adapter):
                 )
             except Exception as exc:
                 return CallResult(
-                    ok=False, events=events, error=f"GetTask failed: {exc}"
+                    ok=False, events=events,
+                    timed_out=isinstance(exc, httpx.TimeoutException),
+                    error=f"GetTask failed: {exc}",
                 )
 
         ok = state == "TASK_STATE_COMPLETED"

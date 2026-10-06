@@ -28,9 +28,14 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCHEMA_VERSION = 2
+
+# 序号冲突时的退避基数。**必须小**：调用方全在事件循环线程上，
+# 这里的 `time.sleep` 是硬阻塞整个服务的（M2）。
+# 5 次重试的退避总量 = 0.01+0.02+0.03+0.04 = 100ms。
+RETRY_BACKOFF_BASE = 0.01
 
 TASK_STATES = ("submitted", "working", "completed", "failed", "canceled")
 
@@ -165,6 +170,19 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # synchronous=NORMAL：**这是 WAL 模式下的推荐值**，也是本层的性能关键。
+        #
+        # 默认的 FULL 让每次 COMMIT 都 fsync —— 实测单次 add_message 要 4.57ms。
+        # 而 `_execute` 会把一个任务的过程事件**逐条**落库，50 个事件就是
+        # 262ms 的**事件循环硬阻塞**（这期间连 CancelTask 都调度不了，M2）。
+        #
+        # 语义差别（SQLite 官方文档明确说明）：
+        #   - WAL + NORMAL **不会因进程崩溃而损坏或丢已提交数据**；
+        #   - 只有**操作系统崩溃 / 断电**才可能丢掉最近若干个事务。
+        # 对「任务协调日志」这个用途，这个取舍是划算的：
+        # 进程被杀（最常见的崩溃形态）不丢数据，而断电场景由 recover_orphans
+        # 在启动时把活跃任务结算成 failed —— 不会出现「状态卡在 working」。
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -471,6 +489,50 @@ class Store:
     # messages
     # ------------------------------------------------------------------
 
+    def _rollback(self) -> None:
+        """回滚，并**吞掉回滚本身的失败** —— 回滚都失败了说明事务已经不在了，
+        再抛只会掩盖真正的那个异常。"""
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+
+    def _write_txn(self, work: Callable[[], Any], *, retries: int = 5) -> Any:
+        """在一个写事务里跑 `work`，序号冲突则重试。
+
+        三件事必须做对：
+
+        1. **任何异常都要 ROLLBACK**（M1）。否则这条连接会卡在未提交事务里，
+           之后所有写都落在同一事务中永不提交，下一次 `BEGIN IMMEDIATE` 还会
+           以 "cannot start a transaction within a transaction" 失败 ——
+           一次脏数据毒化后续**全部**请求。
+        2. **重试只针对 `IntegrityError`**（序号唯一约束冲突），其余异常立刻抛，
+           不浪费重试预算。
+        3. **退避必须短**（M2）。调用方全在事件循环线程上，这里的 `time.sleep`
+           是**硬阻塞整个服务**的 —— 退避总量必须可控。
+           注：`OperationalError`（SQLITE_BUSY）刻意不在这里重试 ——
+           `busy_timeout=5000` 已经在 SQLite 内部等过了，再叠一层只是把
+           阻塞时间翻倍。
+
+        `work` 里**不要**再 `BEGIN`/`COMMIT`，事务由本方法负责。
+        """
+        for attempt in range(retries):
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                result = work()
+                self._conn.execute("COMMIT")
+                return result
+            except sqlite3.IntegrityError:
+                self._rollback()
+                if attempt == retries - 1:
+                    raise
+                time.sleep(RETRY_BACKOFF_BASE * (attempt + 1))
+            except BaseException:
+                # 兜底回滚：任何其它异常（`_dumps` 的 TypeError、KeyboardInterrupt…）
+                # 都必须先 ROLLBACK 再抛（M1）
+                self._rollback()
+                raise
+
     def add_message(
         self,
         task_id: str,
@@ -486,56 +548,31 @@ class Store:
         序号分配与插入必须**在同一个事务里**（A2A-18）：
         分成两条自动提交语句的话，两个连接可能同时读到同一个 MAX(seq)，
         插入重复序号，之后按 seq 排序的消息顺序就不稳定了。
-        配合 `UNIQUE(task_id, seq)` 做兜底，冲突则重试。
+
+        **一条消息一次事务**，所以逐条追加很贵（WAL 下每次 COMMIT 都是一次
+        fsync）。要写多条请用 `add_messages`（M2）。
         """
         message_id = message_id or new_id()
         now = utcnow()
         seq = 0
 
-        for attempt in range(5):
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                row = self._conn.execute(
-                    "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE task_id = ?",
-                    (task_id,),
-                ).fetchone()
-                seq = int(row["s"]) + 1
-                self._conn.execute(
-                    """
-                    INSERT INTO messages(id, task_id, seq, role, kind, content, metadata, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (message_id, task_id, seq, role, kind, _dumps(content),
-                     _dumps(metadata), now),
-                )
-                self._conn.execute("COMMIT")
-                break
-            except sqlite3.IntegrityError:
-                try:
-                    self._conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                if attempt == 4:
-                    raise
-                time.sleep(0.01 * (attempt + 1))
-            except sqlite3.OperationalError:
-                try:
-                    self._conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
-            except BaseException:
-                # 兜底回滚：任何其它异常（`_dumps` 的 TypeError、KeyboardInterrupt…）
-                # 都必须先 ROLLBACK 再抛。否则这条连接会卡在未提交的事务里，
-                # 之后所有写都落在同一事务中永不提交，下一次 BEGIN IMMEDIATE
-                # 还会以 "cannot start a transaction within a transaction" 失败 ——
-                # 一次脏数据毒化后续全部请求（M1）。
-                try:
-                    self._conn.execute("ROLLBACK")
-                except sqlite3.OperationalError:
-                    pass
-                raise
+        def work() -> None:
+            nonlocal seq
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            seq = int(row["s"]) + 1
+            self._conn.execute(
+                """
+                INSERT INTO messages(id, task_id, seq, role, kind, content, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (message_id, task_id, seq, role, kind, _dumps(content),
+                 _dumps(metadata), now),
+            )
 
+        self._write_txn(work)
         return {
             "id": message_id,
             "task_id": task_id,
@@ -546,6 +583,56 @@ class Store:
             "metadata": metadata or {},
             "created_at": now,
         }
+
+    def add_messages(
+        self, task_id: str, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """**一次事务**写入多条消息（M2）。
+
+        为什么要批量：`_execute` 会把一个任务的过程事件逐条落库，而每条
+        `add_message` 都是一次独立事务 —— WAL 下每次 COMMIT 都要 fsync。
+        实测 50 个事件 = 262ms 的事件循环**硬阻塞**，这期间连 `CancelTask`
+        都调度不了。合成一个事务后 fsync 只发生一次。
+
+        `items` 每项支持 `role` / `kind` / `content` / `metadata` / `message_id`。
+        序号在同一事务内连续分配，顺序与传入顺序一致。
+        """
+        if not items:
+            return []
+        now = utcnow()
+        out: list[dict[str, Any]] = []
+
+        def work() -> None:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            seq = int(row["s"])
+            for item in items:
+                seq += 1
+                mid = item.get("message_id") or new_id()
+                self._conn.execute(
+                    """
+                    INSERT INTO messages(id, task_id, seq, role, kind, content, metadata, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (mid, task_id, seq, item.get("role") or "agent",
+                     item.get("kind") or "text", _dumps(item.get("content")),
+                     _dumps(item.get("metadata")), now),
+                )
+                out.append({
+                    "id": mid,
+                    "task_id": task_id,
+                    "seq": seq,
+                    "role": item.get("role"),
+                    "kind": item.get("kind"),
+                    "content": item.get("content"),
+                    "metadata": item.get("metadata") or {},
+                    "created_at": now,
+                })
+
+        self._write_txn(work)
+        return out
 
     def list_messages(self, task_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(

@@ -843,12 +843,19 @@ class Hub:
             )
             return
 
-        for event in result.events:
-            self.store.add_message(
-                task_id, role="agent", kind=event.kind,
-                content=[{"text": event.text}],
-                metadata=event.metadata,
-            )
+        # 过程事件**一次事务写完**，不要逐条 —— 逐条时每次 COMMIT 都要 fsync，
+        # 50 个事件实测把事件循环硬阻塞 193ms，这期间连 CancelTask 都调度不了（M2）。
+        # 合成一个事务后 0.9ms。
+        if result.events:
+            self.store.add_messages(task_id, [
+                {
+                    "role": "agent",
+                    "kind": event.kind,
+                    "content": [{"text": event.text}],
+                    "metadata": event.metadata,
+                }
+                for event in result.events
+            ])
 
         if result.ok:
             self.store.add_artifact(

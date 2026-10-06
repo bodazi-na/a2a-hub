@@ -10,6 +10,20 @@
 验证三件事：detect / probe / 跨轮续接。
 续接用「记住 7391 再追问」这个项目里一直用的验证套路，
 好处是能一眼看出是真续接还是模型瞎猜。
+
+本机路径从哪来
+--------------
+这些启动器路径**因机器而异，不要写死**。默认从环境推导，可用环境变量覆盖：
+
+| 变量 | 含义 | 默认 |
+| --- | --- | --- |
+| `NPM_GLOBAL_BIN` | npm 全局 bin 目录 | `%APPDATA%\\npm` |
+| `DSH_LAUNCHER` | dsh 启动器完整路径 | 空 → 用裸名 `dsh`，靠 PATH 解析 |
+| `QODER_MODEL` | Qoder 的 modelID（**UUID**，不是显示名） | 空 → 该节点跳过 |
+| `QODER_PAT_FILE` | Qoder PAT 文件路径 | `<仓库上级>/.qoder_pat` |
+
+这是**集成级**测试（见 CONTRIBUTING.md）—— 它验证的是适配器与本机工具的对接，
+只在开发机上跑。缺哪个节点就跳过哪个，不算失败。
 """
 
 from __future__ import annotations
@@ -22,11 +36,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from adapters.cli import ClaudeCLI, CodexCLI, DshCLI, QoderCLI  # noqa: E402
 
-NPM = r"C:\Users\a1299\AppData\Roaming\npm"
-DSH_LAUNCHER = r"D:\DSH\resources\runtime\cli\bin\dsh.cmd"
-QODER_MODEL = "d6dc9388-f023-443f-b702-2d154f1ac322"
+# 默认值从环境推导；**不要把某个人的用户名写进仓库**
+NPM = os.environ.get("NPM_GLOBAL_BIN") or os.path.join(
+    os.environ.get("APPDATA", ""), "npm"
+)
+# 空则用裸名，交给适配器的 PATH 解析（见 adapters/cli.py 的 _argv）
+DSH_LAUNCHER = os.environ.get("DSH_LAUNCHER") or "dsh"
+# Qoder 的 -m 必须传 modelID（UUID）；传显示名会静默回退到内置模型
+QODER_MODEL = os.environ.get("QODER_MODEL", "")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PAT_FILE = os.path.join(os.path.dirname(ROOT), ".qoder_pat")
+PAT_FILE = os.environ.get("QODER_PAT_FILE") or os.path.join(
+    os.path.dirname(ROOT), ".qoder_pat"
+)
 
 
 def read_qoder_pat() -> str:
@@ -62,7 +83,23 @@ async def main() -> int:
     if name not in BUILDERS:
         raise SystemExit(f"unknown cli: {name} (可选 {list(BUILDERS)})")
 
+    # 缺配置就**明确跳过**，不要崩，也不要假装测过。
+    # 这是集成级测试：它验证的是「适配器与本机工具的对接」，
+    # 本机没装那个工具时本来就无从验证。
+    if name == "qoder" and not QODER_MODEL:
+        print("SKIP（未测试）：没有 QODER_MODEL。")
+        print("  Qoder 的 -m 必须传 modelID（UUID），不能传显示名 ——")
+        print("  传显示名会被静默回退到内置模型并消耗 Qoder 额度。")
+        print("  用 `qodercli --list-models` 查到 UUID 后：export QODER_MODEL=<uuid>")
+        return 0
+
     adapter = BUILDERS[name]()
+    if not adapter.detect():
+        print(f"SKIP（未测试）：本机找不到 {name} 的启动器。")
+        print(f"  command = {adapter.command}")
+        print("  用环境变量指定路径（见本文件顶部说明），或确认它已装好并在 PATH 上。")
+        return 0
+
     print(f"===== {name} =====")
     print("detect :", adapter.detect())
     print("probe  :", await adapter.probe())

@@ -20,8 +20,8 @@ Error: SetNamedSecurityInfoW failed (Win32 5): grantWrite(<工作区>)
 
 ```
 $ powershell -File tools\fix-sandbox-acl.ps1 -DryRun
-当前用户 : ACBODAZI\a1299
-所有者   : ACBODAZI\a1299
+当前用户 : <机器名>\<用户名>
+所有者   : <机器名>\<用户名>
 受保护   : False
 
 有效权限 : FullControl

@@ -23,8 +23,12 @@
 #    C:\Users\a1299\.workbuddy-ai\binaries\python\envs\a2a-hub
 
 # 2) 注册一个下游 agent
-python hub.py register --name dsh --endpoint http://127.0.0.1:9101 --tag dsh
-python hub.py register --name codex --endpoint http://127.0.0.1:9100 --tag codex
+# CLI 类（推荐，零常驻进程）
+python hub.py register --name dsh-cli   --kind cli --config agents/dsh-cli.json   --tag dsh
+python hub.py register --name codex-cli --kind cli --config agents/codex-cli.json --tag codex
+
+# HTTP 类（下游已经在跑一个 A2A 服务时用；跨机器场景必需）
+# python hub.py register --name dsh --endpoint http://127.0.0.1:9101 --tag dsh
 
 # 3) 看注册表 / 探测健康
 python hub.py agents
@@ -84,11 +88,29 @@ A2A 协议也没强制要求，所以那一侧仍是「尽力而为」。
 
 **调试端点**：`GET /admin/agents`（注册表与能力）、`GET /admin/tasks`（运行中任务）。
 
+## 怎么选接入方式：CLI 优先，桥为备选
+
+同一个 agent 往往两条路都能走（DSH 既有 `dsh-a2a` 桥，也有 `dsh` CLI）。**优先选 CLI**：
+
+| | CLI 类 | HTTP 类（桥） |
+| --- | --- | --- |
+| 常驻进程 | **零** | 每个 agent 一个 |
+| 部署 | 直接可用 | 要先起桥 |
+| 跨机器 | ❌ 只能本机 | ✅ |
+| 给别的进程用 | ❌ | ✅ |
+
+**单机自用 → CLI；要对外暴露或跨机器 → 桥。**
+
+本项目的实际拓扑就是这么定的：`claude-cli` / `codex-cli` / `dsh-cli` / `qoder-cli` 四个 CLI 节点，
+两条 HTTP 桥（9100 / 9101）**已退役**——CLI 已能直连，没必要多养两个常驻进程。
+
+`A2AHttpAdapter` 的代码保留并继续维护，因为跨机器场景离不开它。
+
 ## 适配器：两类下游
 
 | 类型 | 类 | 对接对象 | 需要常驻进程 |
 | --- | --- | --- | --- |
-| **HTTP** | `A2AHttpAdapter` | 已经在跑的 A2A 服务（本机 9100 / 9101 桥） | 是 |
+| **HTTP** | `A2AHttpAdapter` | 已经在跑的 A2A 服务（如本机的 9100 / 9101 桥） | 是 |
 | **CLI** | `ClaudeCLI` / `QoderCLI` / `CodexCLI` / `DshCLI` | 直接起子进程调 CLI 本体 | 否 |
 
 CLI 类少一层桥、少一个常驻进程，代价是自己管子进程生命周期、超时、取消。
@@ -468,7 +490,7 @@ python hub.py register --name codex --endpoint http://127.0.0.1:9100 --tag codex
 
 ## 下一步
 
-- **接真实下游**：把 `dsh-a2a`(:9101) / `codex-a2a`(:9100) 注册进来即可，无需改代码
+- **接真实下游**：见下方「怎么选接入方式」
 - **Qoder 适配器**：`qodercli -p -o stream-json`，注意 `-m` 必须传 modelID（UUID），且 stdout 会混非 JSON 文本需按行过滤
 - **CLI 类适配器**：`adapters/cli.py`，把 `claude -p` / `codex exec` / `qodercli -p` 包成同一契约
 - **编排**：串行链、并行扇出、主管-工人（依赖本内核的持久化）

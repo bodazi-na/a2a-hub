@@ -332,6 +332,31 @@ facade 连不上 hub 时会返回明确的错误提示（含「请先运行 hub.
 | `GET /admin/trace/<id>` | 单个 trace（含人类可读的 `view` 字段） |
 | `POST /admin/probe` | 触发健康探测（可传 `{"name":"..."}` 只探一个） |
 
+## 测试
+
+自检脚本按「**是否需要本机环境**」分两组：
+
+```bash
+python tests/run_all.py          # 单元级（CI 用这个）
+python tests/run_all.py --all    # 单元 + 集成
+python tests/run_all.py --list   # 只看分组
+```
+
+| 组 | 脚本 | 依赖 |
+| --- | --- | --- |
+| **单元级** | `test_cancel_semantics` · `test_p2_fixes` · `test_adapter_p2` · `test_isolation` | 内存 Store + 假适配器，**零外部依赖** |
+| **集成级** | `test_cli_lifecycle` · `test_kill_tree` · `test_cli_direct` · `test_async_cancel` · `test_p1_fixes` · `test_mcp_facade` | 真实 CLI / Windows 进程命令 / hub 在跑 |
+
+**这条分界线就是「薄核心 / 厚适配器」的边界**：
+
+```
+单元级全绿  ⟺  core 确实与平台无关（store · router · orchestrator · hub_app 的逻辑）
+集成级      ⟺  适配器与本机工具的对接（只能在开发机上验证）
+```
+
+所以 CI 只跑单元级 —— 它同时起到了**架构约束的自动验证器**的作用，
+而不只是防回归。见 `.github/workflows/ci.yml`（ubuntu + windows × py3.10 / py3.13）。
+
 ## 目录分层：代码 / 运行时 / 本机配置
 
 这个仓库**可以独立使用，也可以直接开源** —— 代码层不含任何本机路径、凭据或运行时数据。

@@ -1,0 +1,16 @@
+# Codex：把下面这段追加到 ~/.codex/config.toml，然后重启 Codex。
+#
+# 注意：env 必须给 PYTHONPATH —— 解释器里没有 mcp_facade 这个包（它是本仓库源码），
+# 缺了会启动失败，而 Codex 不会报「服务器起不来」，只会让你看不到工具。
+
+[mcp_servers.a2a-hub]
+command = '<PYTHON>'
+args = ["-m", "mcp_facade"]
+cwd = '<A2A_HUB_DIR>'
+startup_timeout_sec = 60
+
+[mcp_servers.a2a-hub.env]
+PYTHONPATH = '<A2A_HUB_DIR>'
+HUB_URL = 'http://127.0.0.1:9200'
+# hub 启用 Bearer 认证时再加：
+# HUB_TOKEN = '<your-token>'

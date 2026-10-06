@@ -1,0 +1,36 @@
+# ---- 运行时数据（不进仓库）----
+data/
+workspace/
+agents/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 接入工具的本机生成物 ----
+# Codex 会按 MCP 配置里的 cwd 认定「项目根」，并在那里自动生成 skill
+# （实测生成了 skills/a2a-hub/{SKILL.md,agents/openai.yaml}）。
+# 那是它自己的产物，别人 clone 后会自动再生成一份，不该进仓库。
+/skills/
+.codex/
+.claude/
+
+# ---- 凭据 ----
+.env
+.env.*
+*.pat
+.qoder_pat
+.qoder_token
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

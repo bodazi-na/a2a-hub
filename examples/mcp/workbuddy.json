@@ -1,0 +1,16 @@
+{
+  "_comment": "WorkBuddy：把下面这段合进 ~/.workbuddy-ai/mcp.json 的 mcpServers。",
+  "_note": "command 用你的 Python；cwd 指向 a2a-hub 目录（facade 需要能 import mcp_facade）。",
+  "mcpServers": {
+    "a2a-hub": {
+      "type": "stdio",
+      "command": "<PYTHON>",
+      "args": ["-m", "mcp_facade"],
+      "cwd": "<A2A_HUB_DIR>",
+      "env": {
+        "PYTHONPATH": "<A2A_HUB_DIR>",
+        "HUB_URL": "http://127.0.0.1:9200"
+      }
+    }
+  }
+}

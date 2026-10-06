@@ -1,0 +1,12 @@
+# Claude Code：一条命令接入（等价于写进 ~/.claude.json 的 mcpServers）
+
+claude mcp add a2a-hub \
+  --env PYTHONPATH="<A2A_HUB_DIR>" \
+  --env HUB_URL="http://127.0.0.1:9200" \
+  -- <PYTHON> -m mcp_facade
+
+# 验证：在 Claude Code 里执行
+#   /mcp            → 应能看到 a2a-hub 及其 6 个工具
+#
+# 说明：cwd 需为 <A2A_HUB_DIR>（facade 要能 import mcp_facade）。
+# Claude Code 的 mcp add 默认继承当前目录，所以在那之前先 cd 到 a2a-hub。

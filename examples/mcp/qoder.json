@@ -1,0 +1,14 @@
+{
+  "_comment": "Qoder：把下面这段合进 ~/.qoder/mcp.json 的 mcpServers，重启 Qoder 生效。",
+  "mcpServers": {
+    "a2a-hub": {
+      "command": "<PYTHON>",
+      "args": ["-m", "mcp_facade"],
+      "cwd": "<A2A_HUB_DIR>",
+      "env": {
+        "PYTHONPATH": "<A2A_HUB_DIR>",
+        "HUB_URL": "http://127.0.0.1:9200"
+      }
+    }
+  }
+}

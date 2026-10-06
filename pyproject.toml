@@ -1,0 +1,53 @@
+[project]
+name = "a2a-hub"
+version = "0.2.0"
+description = "多 Agent A2A 协调内核：注册发现、能力路由、持久化、编排与审计"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["a2a", "agent", "orchestration", "mcp", "multi-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+# 刻意保持极少的依赖：
+#   - 服务端只要 starlette + uvicorn
+#   - 客户端只要 httpx
+#   - SQLite 走标准库
+# A2A 协议面自己实现（见 adapters/a2a_http.py 的说明），不依赖 a2a-sdk。
+dependencies = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# MCP facade：让支持 MCP 的 agent 平台（Codex / Qoder / Claude Code / WorkBuddy…）
+# 都能调用 hub。**可选** —— core/ 是纯 A2A，不装这个也能完整运行。
+mcp = ["mcp>=2.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+a2a-hub = "hub:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/a2a-hub"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# hub.py 是入口脚本；其余是包
+py-modules = ["hub"]
+packages = ["core", "adapters", "probes", "mcp_facade"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ 下的多数脚本是「可独立运行的自检脚本」而非 pytest 用例，
+# 用 pytest 跑时只收集 test_*.py 里显式的 test_ 函数。
+python_files = ["test_*.py"]

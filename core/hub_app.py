@@ -169,6 +169,21 @@ def _duration_ms(started: str | None, finished: str | None) -> int | None:
     return max(0, int((b - a).total_seconds() * 1000))
 
 
+def _task_started_at(task: dict[str, Any]) -> str | None:
+    """任务的「开始时刻」——**不是** `created_at`。
+
+    编排层会预先为每个 step 落占位任务，记录在 plan 开始那一刻就诞生了，
+    但可能几分钟后才真正开始跑。拿 `created_at` 当开始时刻，层间排队等待
+    会被算进执行时长（实测 merge 步虚高 2.5 倍），控制台甘特图上四根条
+    还会全部从 t=0 起画（N2）。
+
+    尚未开始的任务（还没轮到的 step、排队中的请求）`started_at` 为空，
+    回退到 `created_at` —— 这样它在图上表现为「从那时起就在等」，
+    而不是一片空白。
+    """
+    return task.get("started_at") or task.get("created_at")
+
+
 def _to_a2a_task(task: dict[str, Any], messages: list, artifacts: list) -> dict[str, Any]:
     """把库里的 task 投影成 A2A Task 结构。"""
     status: dict[str, Any] = {"state": STATE_MAP.get(task["state"], "TASK_STATE_UNKNOWN")}
@@ -391,9 +406,11 @@ class Hub:
                     "stepId": t.get("step_id"),
                     "agent": t.get("agent"),
                     "state": t["state"],
-                    "startedAt": t["created_at"],
+                    "createdAt": t["created_at"],
+                    "startedAt": _task_started_at(t),
                     "finishedAt": t.get("finished_at"),
-                    "durationMs": _duration_ms(t["created_at"], t.get("finished_at")),
+                    "durationMs": _duration_ms(_task_started_at(t),
+                                               t.get("finished_at")),
                     "prompt": (t.get("prompt") or "")[:160],
                     "error": t.get("error"),
                 }
@@ -639,8 +656,24 @@ class Hub:
             self.store.get_context_session(context_id, record.name)
             if context_id else None
         )
-        await self._execute(task_id, record, adapter, prompt, context_id,
-                            session_id, timeout)
+        # 与 SendMessage 共用同一套「登记 → 等待」语义。
+        # **必须登记进 _running**：否则 CancelTask 查不到这个任务，只能走兜底分支
+        # 改状态而拦不住执行 —— 取消变成「假成功」，子进程继续跑、继续烧额度、
+        # 继续往 workspace 写盘，而结果又被 only_from 挡在库外（N1）。
+        bg = asyncio.create_task(
+            self._execute(task_id, record, adapter, prompt, context_id,
+                          session_id, timeout)
+        )
+        self._running[task_id] = bg
+        bg.add_done_callback(lambda _t, tid=task_id: self._running.pop(tid, None))
+        try:
+            await bg
+        except asyncio.CancelledError:
+            # 调用方不等了（RPC handler 被取消）：把取消转嫁给这一步并等它结算完。
+            # 只 re-raise 不等它的话，会留下一个「还在后台跑、但没人知道」的任务。
+            bg.cancel()
+            await asyncio.gather(bg, return_exceptions=True)
+            raise
         return self._task_payload(task_id)
 
     async def _execute(
@@ -662,6 +695,12 @@ class Hub:
         终态写入一律带 `only_from`：取消和完成可能并发，
         谁先到谁生效，后到的不许覆盖（A2A-01）。
         """
+        # 「真正开始执行」的时刻。**与 created_at 区分开**：编排层会预先为每个
+        # step 落占位任务，记录在 plan 开始那一刻就诞生了，但这一层可能几分钟后
+        # 才轮到它。拿 created_at 当开始时刻，层间排队等待会被算进执行时长（N2）。
+        # 带 only_from：任务若在派活前就已被取消，不该再补 started_at。
+        self.store.update_task(task_id, started=True, only_from=ACTIVE_STATES)
+
         lock = self._context_lock(context_id, record.name) if context_id else None
         if lock is not None:
             await lock.acquire()
@@ -860,9 +899,11 @@ class Hub:
                     "parentId": t.get("parent_id"),
                     "agent": t.get("agent"),
                     "state": t["state"],
-                    "startedAt": t["created_at"],
+                    "createdAt": t["created_at"],
+                    "startedAt": _task_started_at(t),
                     "finishedAt": t.get("finished_at"),
-                    "durationMs": _duration_ms(t["created_at"], t.get("finished_at")),
+                    "durationMs": _duration_ms(_task_started_at(t),
+                                               t.get("finished_at")),
                     "prompt": (t.get("prompt") or "")[:200],
                     "error": t.get("error"),
                 }

@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 TASK_STATES = ("submitted", "working", "completed", "failed", "canceled")
 
@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     step_id     TEXT,
     parent_id   TEXT,
     created_at  TEXT NOT NULL,
+    started_at  TEXT,
     updated_at  TEXT NOT NULL,
     finished_at TEXT,
     error       TEXT,
@@ -202,6 +203,19 @@ class Store:
         for col in ("plan_id", "step_id", "parent_id", "trace_id"):
             if col not in task_cols:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+        # started_at：**真正开始执行**的时刻，与 created_at（记录诞生）分开。
+        # 编排层会先为每个 step 落占位任务（A2A-07），若拿 created_at 当开始时刻，
+        # 层间排队等待会被算进执行时长 —— 实测 merge 步虚高 2.5 倍（N2）。
+        # 老库回填 created_at 作近似：对非编排任务二者本来就几乎相同；
+        # 历史编排任务的时长仍是旧的虚高值，无法追溯还原。
+        if "started_at" not in task_cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN started_at TEXT")
+            terminal = tuple(s for s in TASK_STATES if s not in ("submitted",))
+            self._conn.execute(
+                f"UPDATE tasks SET started_at = created_at "
+                f"WHERE started_at IS NULL AND state IN ({','.join('?' * len(terminal))})",
+                terminal,
+            )
         # 索引必须等列补好之后再建 —— 老库上 executescript 阶段还没有这些列
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id, step_id)"
@@ -310,6 +324,7 @@ class Store:
         agent: str | None = None,
         error: str | None = None,
         metadata: dict[str, Any] | None = None,
+        started: bool = False,
         finished: bool = False,
         only_from: tuple[str, ...] | None = None,
     ) -> dict[str, Any] | None:
@@ -318,6 +333,10 @@ class Store:
         `only_from` 给出**允许的前置状态**，用于终态写入的原子保护：
         「取消」和「完成」可能并发发生，谁先到谁生效，后到的不许覆盖。
         没有这个条件，一个已被取消的同步任务跑完仍会把状态改成 completed。
+
+        `started` / `finished` 分别打上「真正开始执行」和「进入终态」的时刻。
+        **两者与 `created_at` 是三件不同的事**：编排层会预先落占位任务，
+        记录在 plan 开始那一刻就诞生了，但可能几分钟后才真正开始跑（N2）。
 
         返回更新后的 task；若因前置状态不匹配而未更新，会带上 `_updated: False`。
         """
@@ -336,6 +355,9 @@ class Store:
         if metadata is not None:
             sets.append("metadata = ?")
             args.append(_dumps(metadata))
+        if started:
+            sets.append("started_at = ?")
+            args.append(utcnow())
         if finished:
             sets.append("finished_at = ?")
             args.append(utcnow())
@@ -371,6 +393,7 @@ class Store:
             "step_id": row["step_id"] if "step_id" in keys else None,
             "parent_id": row["parent_id"] if "parent_id" in keys else None,
             "created_at": row["created_at"],
+            "started_at": row["started_at"] if "started_at" in keys else None,
             "updated_at": row["updated_at"],
             "finished_at": row["finished_at"],
             "error": row["error"],

@@ -223,61 +223,70 @@ class Orchestrator:
             )
             placeholders[step.id] = task["id"]
 
-        for layer in layers:
-            if aborted:
-                break
-
-            runnable: list[Step] = []
-            for sid in layer:
-                step = by_id[sid]
-                failed_deps = [
-                    d for d in step.depends_on
-                    if d not in results or not results[d].ok
-                ]
-                if failed_deps:
-                    if step.on_error == ON_ERROR_CONTINUE:
-                        results[sid] = StepResult(
-                            id=sid, ok=False, skipped=True,
-                            error=f"依赖失败被跳过: {failed_deps}",
-                        )
-                        continue
-                    results[sid] = StepResult(
-                        id=sid, ok=False, error=f"依赖失败: {failed_deps}"
-                    )
-                    aborted = True
+        # 逐层执行。整段包在 try/finally 里：**无论正常结束、上游中止还是被取消，
+        # 未执行的 step 都必须结算** —— 否则它们会永远停在 submitted，
+        # 既没有 worker 也没有终态，GetPlan 只能看到一个卡住的 plan（P1-5）。
+        reason = "skipped: 上游中止，本步未执行"
+        try:
+            for layer in layers:
+                if aborted:
                     break
-                runnable.append(step)
 
-            if aborted or not runnable:
-                continue
+                runnable: list[Step] = []
+                for sid in layer:
+                    step = by_id[sid]
+                    failed_deps = [
+                        d for d in step.depends_on
+                        if d not in results or not results[d].ok
+                    ]
+                    if failed_deps:
+                        if step.on_error == ON_ERROR_CONTINUE:
+                            results[sid] = StepResult(
+                                id=sid, ok=False, skipped=True,
+                                error=f"依赖失败被跳过: {failed_deps}",
+                            )
+                            continue
+                        results[sid] = StepResult(
+                            id=sid, ok=False, error=f"依赖失败: {failed_deps}"
+                        )
+                        aborted = True
+                        break
+                    runnable.append(step)
 
-            settled = await asyncio.gather(
-                *(self._run_step(s, plan_id, context_id, plan_input, results,
-                                 trace_id, placeholders[s.id])
-                  for s in runnable),
-                return_exceptions=True,
-            )
+                if aborted or not runnable:
+                    continue
 
-            for step, outcome in zip(runnable, settled):
-                if isinstance(outcome, BaseException):
-                    outcome = StepResult(
-                        id=step.id, ok=False,
-                        error=f"{type(outcome).__name__}: {outcome}",
-                    )
-                results[step.id] = outcome
-                if not outcome.ok and step.on_error != ON_ERROR_CONTINUE:
-                    aborted = True
-
-        for sid in by_id:
-            if sid not in results:
-                results[sid] = StepResult(id=sid, ok=False, skipped=True,
-                                          error="未执行（上游中止）")
-                # 占位任务也要结算，否则它会永远停在 submitted（A2A-07 + A2A-09）
-                self.hub.store.update_task(
-                    placeholders[sid], state="canceled",
-                    error="skipped: 上游中止，本步未执行",
-                    finished=True, only_from=("submitted", "working"),
+                settled = await asyncio.gather(
+                    *(self._run_step(s, plan_id, context_id, plan_input, results,
+                                     trace_id, placeholders[s.id])
+                      for s in runnable),
+                    return_exceptions=True,
                 )
+
+                for step, outcome in zip(runnable, settled):
+                    if isinstance(outcome, asyncio.CancelledError):
+                        # 走到这里，一定是**单个 step 被 CancelTask 显式取消**，
+                        # 不是整轮被取消 —— 调用方断开时 `await gather(...)` 会直接
+                        # 抛 CancelledError（实测见 tests/test_plan_cancel_and_timing.py），
+                        # 那条路不经过这里。所以**不要**把它当「整轮取消」抛出去：
+                        # 该 step 的取消是它自己的结果，plan 是否继续由 on_error 决定。
+                        outcome = StepResult(
+                            id=step.id, ok=False,
+                            error="canceled: 该 step 被显式取消",
+                        )
+                    elif isinstance(outcome, BaseException):
+                        outcome = StepResult(
+                            id=step.id, ok=False,
+                            error=f"{type(outcome).__name__}: {outcome}",
+                        )
+                    results[step.id] = outcome
+                    if not outcome.ok and step.on_error != ON_ERROR_CONTINUE:
+                        aborted = True
+        except asyncio.CancelledError:
+            reason = "canceled: 本次运行被中断，本步未执行"
+            raise
+        finally:
+            self._settle_unexecuted(by_id, results, placeholders, reason=reason)
 
         return PlanResult(
             plan_id=plan_id,
@@ -285,6 +294,24 @@ class Orchestrator:
             steps=results,
             layers=layers,
         )
+
+    def _settle_unexecuted(self, by_id: dict[str, Step],
+                           results: dict[str, StepResult],
+                           placeholders: dict[str, str], *, reason: str) -> None:
+        """把「没轮到的 step」结算掉。
+
+        幂等：已经在 `results` 里的 step（跑过、失败过、被跳过）一律不动。
+        占位任务不结算就会永远停在 submitted —— 有活跃态、无 worker、
+        无终态，调用方只能一直等（A2A-07 + A2A-09）。
+        """
+        for sid in by_id:
+            if sid in results:
+                continue
+            results[sid] = StepResult(id=sid, ok=False, skipped=True, error=reason)
+            self.hub.store.update_task(
+                placeholders[sid], state="canceled", error=reason,
+                finished=True, only_from=("submitted", "working"),
+            )
 
     async def _run_step(self, step: Step, plan_id: str, context_id: str,
                         plan_input: str, results: dict[str, StepResult],

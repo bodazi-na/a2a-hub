@@ -190,14 +190,37 @@ LLM 审查的价值取决于「说的是不是真的」。我抽查了 **6 条�
 | --- | --- | --- |
 | P0-1 `dispatch_task` 不登记 `_running` | ✅ 属实 | `hub_app.py:642` 直调 `_execute` |
 | M1 `add_message` 异常回滚不全 | ✅ 属实 | 只捕 `IntegrityError`/`OperationalError`；`_dumps` 无 `default=str` |
-| P1-1 子步骤取消被降级 | ✅ 属实 | `orchestrator.py:262` `isinstance(outcome, BaseException)` |
+| P1-1 子步骤取消被降级 | ⚠️ **代码属实、后果判断错误** | 见下方更正 |
 | P2-1 缺省 `plan_id` 用 `abs(hash(...))` | ✅ 属实 | `orchestrator.py:206` |
 | P2-2 `parse_timeout` 重复调用 | ✅ 属实 | `hub_app.py:509` 与 `546` |
 | P2-3 复用占位任务时 `None` 覆盖 metadata | ✅ 属实 | `hub_app.py:602-607` |
 
-**实质结论 6/6 属实。**
+**实质结论 5/6 属实，1 条后果判断错误。**
 
-但**行号不可用**：
+### 更正：P1-1 的后果分析不成立
+
+审查员说的代码事实是对的（`orchestrator.py:262` 的 `isinstance(outcome, BaseException)`
+确实会接住 `CancelledError`），但结论「取消被改写成这一步失败、调用方拿到正常
+`PlanResult` 而不是取消」**不成立** —— 它混淆了两种取消。
+
+用实验钉死（`tests/test_plan_cancel_and_timing.py` 的 `test_gather_cancel_semantics`）：
+
+| 场景 | `gather(return_exceptions=True)` 的行为 |
+| --- | --- |
+| 调用方取消整轮 | **直接抛 `CancelledError`** —— 取消本来就正确传播，根本没被吞 |
+| 只有单个 step 被取消 | 正常返回 `[CancelledError, 'str']` —— 取消作为**结果**出现 |
+
+所以调用方断开那条路不经过这个分支；而单个 step 被取消时，
+「作为该 step 的结果、交给 `on_error` 决定 plan 是否继续」**恰恰是正确行为**。
+
+**按原建议改成 re-raise 反而有害** —— 会让单个 step 的取消变成异常炸穿整条 plan，
+而正确行为是产出一个干净的 `PlanResult(ok=False)`。
+修复时改为显式转换并写明原因（错误文案 `canceled: 该 step 被显式取消`）。
+
+**这条值得单独记下来**：LLM 审查可能「代码事实正确、因果链错误」。
+只核对「它说的代码是不是那样」不够，还要核对「由此推出的后果是否真的成立」。
+
+### 行号不可用
 
 | 条目 | 清单标注 | 实际行号 |
 | --- | --- | --- |
@@ -208,8 +231,7 @@ LLM 审查的价值取决于「说的是不是真的」。我抽查了 **6 条�
 偏差 31 / 42 / 54，不固定 —— 是估算而非抄录。
 （staged 文件与源文件经 `diff` 确认完全一致，1082 行，不存在「读错文件」的可能。）
 
-**结论：这份清单实质可信，但引用前必须重新定位行号。**
-这也是把 LLM 审查接入流水线时必须配套的一步 —— 不能直接采信位置信息。
+**结论：这份清单实质可信（但需逐条验证后果），且引用前必须重新定位行号。**
 
 ## 六、结论与建议
 
@@ -232,3 +254,43 @@ echo 级验证永远碰不到。这就是真实负载演练不可替代的原因
 3. N3（P1，需要先定设计：`Step` 是否要能声明写需求）
 4. N4（P1，异步 `RunPlan`）
 5. N5（P2，或在控制台加一行免责说明即可）
+
+---
+
+## 七、修复记录（2026-10-06 下午）
+
+### 已修：N1、N2，外加两个同源缺口
+
+只修 N1 是不够的 —— `_running` 登记只解决 hub 层，编排层还有两处会让
+「取消」失效，不一起修的话「取消已修复」是句假话。
+
+| 编号 | 改动 | 文件 |
+| --- | --- | --- |
+| **N1** | `dispatch_task` 改为 `create_task` + 登记 `_running` + done_callback，并 `await`；调用方取消时把取消转嫁给该 step 并等它结算 | `core/hub_app.py` |
+| **N2** | 新增 `started_at` 列（`created_at` = 记录诞生，`started_at` = 真正开始执行）；`_execute` 进入时打点；`_duration_ms` 与两处视图改用 `_task_started_at()`；schema v1 → v2，老库回填 | `core/store.py`、`core/hub_app.py` |
+| **P1-5** | `Orchestrator.run` 的逐层循环包进 `try/finally`，新增 `_settle_unexecuted()`，任何路径（含被取消）都结算未执行的 step | `core/orchestrator.py` |
+| **P1-1** | **不采纳原建议**。改为显式转换并写明判定依据（见第五节更正） | `core/orchestrator.py` |
+
+新增回归：`tests/test_plan_cancel_and_timing.py`（已进单元级分组，CI 可跑）。
+
+### 验证结果
+
+| 验证项 | 结果 |
+| --- | --- |
+| 单元级回归 | **5/5 PASS** |
+| schema 迁移（线上库副本，87 个任务） | 列已加、`schemaVersion` 1→2、数据完好、`started_at` 全部回填 |
+| hub 重启（真实线上库） | `schemaVersion: 2`，87 个任务与 4 个 agent 全部保留 |
+| N1 线上实证 | `running` 快照从恒为 0 → **1**；CancelTask 后回到 **0**，无孤儿进程 |
+| N1 取消后收尾 | plan 返回 `ok=False`（**不抛异常**），被取消的 step 记 `canceled: 该 step 被显式取消`，未执行的 step 全部结算 |
+| N2 线上实证 | `p2` 排队等待 8895ms、实际执行 3690ms —— 新口径报 3690ms，旧口径会报 12585ms（**虚高 3.4 倍**） |
+| N2 甘特图 | `p1` left=0.0% / `p2` left=70.7%，两根条首尾相接 —— 修复前两根都会是 `left=0%` |
+| 单元测试里的极端值 | 第二层真实 70ms，旧口径 1351ms（**虚高 19 倍**） |
+
+**老数据的限制**：历史编排任务的 `started_at` 只能回填 `created_at`，
+那部分虚高值无法追溯还原 —— 已在 `_migrate` 的注释里写明。
+
+### 未修（留待决策）
+
+N3（节点写能力不一致）、N4（`RunPlan` 同步阻塞）、N5（过程回传非实时），
+以及清单里的其余 30+ 条 —— 其中 `orchestrator.py:206` 的
+`abs(hash(...))` 作缺省 `plan_id` 会让两个并发同名 plan 混审计，改动只需一行。

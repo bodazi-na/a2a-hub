@@ -34,6 +34,7 @@ PY = sys.executable
 # 单元级：内存 Store + 假适配器 / 自建假下游，无外部依赖
 UNIT = [
     ("test_cancel_semantics", "取消语义（假适配器）"),
+    ("test_plan_cancel_and_timing", "编排取消 + 计时基准（假适配器）"),
     ("test_p2_fixes", "批次 2 修复（内存 Store）"),
     ("test_adapter_p2", "适配器修复（自建假下游）"),
     ("test_isolation", "隔离（假适配器，不执行 CLI）"),

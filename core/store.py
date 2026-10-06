@@ -26,9 +26,10 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 SCHEMA_VERSION = 2
 
@@ -183,6 +184,9 @@ class Store:
         # 进程被杀（最常见的崩溃形态）不丢数据，而断电场景由 recover_orphans
         # 在启动时把活跃任务结算成 failed —— 不会出现「状态卡在 working」。
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        # 事务不可重入 —— 用这个计数器在嵌套时给出明确报错，
+        # 而不是让 SQLite 抛一句 "cannot start a transaction within a transaction"
+        self._depth = 0
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -390,15 +394,53 @@ class Store:
             where += f" AND state IN ({placeholders})"
             args.extend(only_from)
 
-        cursor = self._conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE {where}", args
-        )
-        updated = cursor.rowcount > 0
+        # UPDATE 与回读必须**在同一个事务里**（P2-12）：分成两条独立语句的话，
+        # 中间可能被别的写者插进来，于是返回的 task 与 `_updated` 对不上 ——
+        # 调用方拿 `_updated=True` 判断「状态归我了」，却看到一个别人改过的状态。
+        def work() -> dict[str, Any] | None:
+            cursor = self._conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE {where}", args
+            )
+            updated = cursor.rowcount > 0
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            task = self._task_row_to_dict(row) if row else None
+            if task is not None:
+                task["_updated"] = updated
+            return task
 
-        task = self.get_task(task_id)
-        if task is not None:
-            task["_updated"] = updated
-        return task
+        return self._write_txn(work)
+
+    def merge_task_metadata(
+        self, task_id: str, patch: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """**原子地**合并任务的 metadata（P1-6）。
+
+        原来的写法是「`get_task` 读 → `update_task` 整列替换」两步，无事务包裹。
+        两个并发写者（典型：`dispatch_task` 复用占位任务补 planId，
+        与 `recover_orphans` 打 interrupted 标记）会**互相覆盖**对方的字段 ——
+        后写的那个把前一个刚加的键整列冲掉。
+
+        这里把读、合并、写放进**同一个写事务**：拿到写锁之后别人插不进来。
+        没有用 SQL 的 `json_patch()` 是因为它的语义是 RFC 7396 ——
+        **值为 null 的键会被删除**，而我们要的是「把键设成 null」。
+        """
+        def work() -> dict[str, Any] | None:
+            row = self._conn.execute(
+                "SELECT metadata FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            current = _loads(row["metadata"], {}) or {}
+            merged = {**current, **patch}
+            self._conn.execute(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (_dumps(merged), utcnow(), task_id),
+            )
+            return merged
+
+        return self._write_txn(work)
 
     @staticmethod
     def _task_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -516,7 +558,9 @@ class Store:
 
         `work` 里**不要**再 `BEGIN`/`COMMIT`，事务由本方法负责。
         """
+        self._check_not_nested()
         for attempt in range(retries):
+            self._depth += 1
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 result = work()
@@ -532,6 +576,49 @@ class Store:
                 # 都必须先 ROLLBACK 再抛（M1）
                 self._rollback()
                 raise
+            finally:
+                self._depth -= 1
+
+    def _check_not_nested(self) -> None:
+        """事务不可重入。嵌套时给一句能看懂的报错。
+
+        让 SQLite 自己报的话是 "cannot start a transaction within a
+        transaction" —— 那句话不告诉你**是谁**在哪儿嵌套的。
+        """
+        if self._depth:
+            raise RuntimeError(
+                "Store 的事务不可重入：已经在事务里了。"
+                "请把多个写操作合成一个 work()，或让它们各自独立提交。"
+            )
+
+    @contextmanager
+    def read_txn(self) -> Iterator["Store"]:
+        """在一个读事务里跑一串查询，拿到**一致的快照**（P2-23）。
+
+        为什么需要它：`isolation_level=None` 下每条语句各自一个隐式事务，
+        于是「先查 task、再查它的 messages、再查 artifacts」这串查询之间
+        会被别的写者插进来 —— 典型症状是「状态已经是 completed，
+        但 artifacts 还没到齐」这种**撕裂读**，调用方会以为产物丢了。
+
+        WAL 模式下 `BEGIN DEFERRED` 之后本连接读到的是事务开始那一刻的快照，
+        整串查询看到的是同一个版本。
+
+        **只读**：里面不要做写操作（写了也不会立刻对别人可见，
+        而且语义上说不通）。
+        """
+        self._check_not_nested()
+        self._depth += 1
+        try:
+            self._conn.execute("BEGIN DEFERRED")
+            try:
+                yield self
+            except BaseException:
+                self._rollback()
+                raise
+            else:
+                self._conn.execute("COMMIT")
+        finally:
+            self._depth -= 1
 
     def add_message(
         self,

@@ -391,13 +391,17 @@ class Hub:
 
     async def admin_tasks(self, request: Request) -> JSONResponse:
         limit = clamp_limit(request.query_params.get("limit"), default=50)
-        recent = self.store.list_tasks(limit=limit)
+        # 列表与总数必须来自**同一个快照**（P2-23）：分开查的话，
+        # 中间新增一个任务就会出现「列表里 50 条、总数却是 51」这种对不上的情况。
+        with self.store.read_txn():
+            recent = self.store.list_tasks(limit=limit)
+            total = self.store.count_tasks()
         return JSONResponse({
             "running": [
                 {"id": tid, "done": t.done(), "cancelled": t.cancelled()}
                 for tid, t in self._running.items()
             ],
-            "total": self.store.count_tasks(),
+            "total": total,
             "recent": [
                 {
                     "taskId": t["id"],
@@ -620,11 +624,13 @@ class Hub:
             # 复用编排层预落的占位任务：它的 metadata 里只有 planned/requestedAgent，
             # 这里补上 planId / stepId，否则 ListTasks 查不到编排归属（审计会缺线索）
             task = existing
-            self.store.update_task(
+            # **原子合并**（P1-6）：原来这里是「读 metadata → 整列替换」两步，
+            # 无事务包裹。若此刻 `recover_orphans` 正在给同一个任务打
+            # interrupted 标记，两边会互相覆盖 —— 后写的那个把前一个刚加的键
+            # 整列冲掉。
+            self.store.merge_task_metadata(
                 task_id,
-                metadata={**(existing.get("metadata") or {}),
-                          "planId": plan_id, "stepId": step_id,
-                          "requestedAgent": agent},
+                {"planId": plan_id, "stepId": step_id, "requestedAgent": agent},
             )
         else:
             task = self.store.create_task(
@@ -956,11 +962,18 @@ class Hub:
         if not trace_id:
             raise LookupError("缺少 traceId（或给 taskId 反查）")
 
-        tasks = self.store.list_trace_tasks(str(trace_id))
+        # 整条 trace 的查询必须来自**同一个快照**（P2-23）：任务列表、消息、
+        # 各任务的 artifacts 分开查的话，一个正在收尾的任务会表现为
+        # 「状态已终态、但产物还没到齐」，审计视图就会自相矛盾。
+        with self.store.read_txn():
+            return self._build_trace(str(trace_id))
+
+    def _build_trace(self, trace_id: str) -> dict[str, Any]:
+        tasks = self.store.list_trace_tasks(trace_id)
         if not tasks:
             raise LookupError(f"trace not found: {trace_id}")
 
-        messages = self.store.list_trace_messages(str(trace_id))
+        messages = self.store.list_trace_messages(trace_id)
 
         started = min(t["created_at"] for t in tasks)
         finished_candidates = [t["finished_at"] for t in tasks if t.get("finished_at")]
@@ -1100,8 +1113,11 @@ class Hub:
                        "**该任务可能已产生副作用**（写入 workspace 的文件等）—— "
                        "重跑前请先检查 workspace，不要仅凭 ok=false 判定它什么都没做。"),
                 finished=True, only_from=ACTIVE_STATES,
-                metadata={**(task.get("metadata") or {}),
-                          "interrupted": True, "sideEffectsPossible": True},
+            )
+            # metadata 用**原子合并**（P1-6），不要「读出来 → 整列替换」——
+            # 那会与同时发生的 `dispatch_task` 补 planId 互相覆盖。
+            self.store.merge_task_metadata(
+                task["id"], {"interrupted": True, "sideEffectsPossible": True}
             )
         return len(orphans)
 
@@ -1139,13 +1155,20 @@ class Hub:
     # ------------------------------------------------------------------
 
     def _task_payload(self, task_id: str) -> dict[str, Any]:
-        task = self.store.get_task(task_id)
-        assert task is not None
-        return _to_a2a_task(
-            task,
-            self.store.list_messages(task_id),
-            self.store.list_artifacts(task_id),
-        )
+        """拼一个任务的完整 A2A payload。
+
+        三个查询必须**在同一个读事务里**（P2-23）：分开查的话，中间可能被
+        终态写入插进来，于是出现「状态已是 completed，但 artifacts 还没到齐」
+        —— 调用方会以为产物丢了。
+        """
+        with self.store.read_txn():
+            task = self.store.get_task(task_id)
+            assert task is not None
+            return _to_a2a_task(
+                task,
+                self.store.list_messages(task_id),
+                self.store.list_artifacts(task_id),
+            )
 
     def _get_adapter(self, record) -> Adapter | None:
         """按需构建适配器，已构建的缓存复用。

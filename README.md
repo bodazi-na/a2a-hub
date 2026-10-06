@@ -323,18 +323,30 @@ facade 通过 HTTP 与 hub 通信，所以两者解耦 —— 换掉 facade，hu
 
 复制 `examples/mcp/` 里对应平台的片段：
 
-| 平台 | 配置文件 | 示例 |
+| 平台 | 配置方式 | 示例 |
 | --- | --- | --- |
 | WorkBuddy | `~/.workbuddy-ai/mcp.json` | `examples/mcp/workbuddy.json` |
 | Codex | `~/.codex/config.toml` | `examples/mcp/codex.toml` |
-| Qoder | `~/.qoder/mcp.json` | `examples/mcp/qoder.json` |
+| Qoder | **CLI 用 `qodercli mcp add`**；IDE 才用 `~/.qoder/mcp.json` | `examples/mcp/qoder.json` |
 | Claude Code | `claude mcp add ...` | `examples/mcp/claude-code.txt` |
 
-**两个必须注意的点**：
+**三个必须注意的点**：
 
 1. **`env.PYTHONPATH` 要给** —— `mcp_facade` 是本仓库源码，不在解释器的 site-packages 里。
    缺了会启动失败，而**多数客户端不会报「服务器起不来」**，只会让你看不到工具（静默失败）。
 2. **`cwd` 指向 a2a-hub 目录** —— facade 需要能 import 到自己。
+3. **无头模式下要放开工具权限**。MCP 工具调用通常会弹权限确认，而无人值守时
+   没人能点「允许」，于是工具被拦下、任务拿不到数据。实测：
+
+   | 平台 | 需要加 |
+   | --- | --- |
+   | Qoder CLI | `--permission-mode auto`（或 `--allowed-mcp-server-names a2a-hub`，视版本而定） |
+   | Claude Code | `--allowedTools` / settings 里的 allowlist |
+   | Codex | 见它自己的 sandbox / approval 配置 |
+
+   **注意 Qoder 的 CLI 与 IDE 用的是两套 MCP 配置**：`~/.qoder/mcp.json` 是 IDE 的，
+   CLI 有自己的一份（用 `qodercli mcp list` 查看、`qodercli mcp add` 添加）。
+   只配了 IDE 那份的话，`qodercli -p` 会告诉你「没有 MCP 工具可用」。
 
 ### 验证接入成功
 
@@ -465,6 +477,30 @@ hub 侧走 **CLI 直连**（直接起子进程，零常驻进程）：
 > 单机自用走 CLI 更简单，桥留给「跨机器 / 对外暴露」场景。
 > `A2AHttpAdapter` 仍然保留，任何符合 A2A 的服务注册即可用。
 
+### 平台调用（2026-10-06 实测）
+
+「各个 Agent 平台能不能调用 hub」——逐个实测，不是照着配置推的：
+
+| 平台 | 路径 | 结果 |
+| --- | --- | --- |
+| **Claude Code** | MCP（`claude mcp add`） | ✅ 正确列出四个节点 |
+| **Qoder CLI** | MCP（`qodercli mcp add` + `--permission-mode auto`） | ✅ 正确列出四个节点 |
+| **Codex** | skill（`~/.codex/skills/a2a-hub`） | ✅ 正确列出四个节点 |
+| **DSH** | skill（`~/.dsh/skills/a2a-hub`） | ✅ 正确列出四个节点 |
+| **WorkBuddy** | skill（`~/.workbuddy-ai/skills/a2a-hub`） | ✅ 正确列出四个节点 |
+
+验证方式：让每个平台「列出 hub 上注册的所有 agent 名字」—— 那些名字它猜不出来，
+答对即证明工具/命令**真的被执行了**。四个平台都返回了
+`claude-cli, codex-cli, dsh-cli, qoder-cli`。
+
+**两点与预期不同，值得记**：
+
+- **Codex 实际走的是 skill 而不是 MCP**：它先试了 MCP，然后改用
+  `~/.codex/skills/a2a-hub/scripts/hub_client.py`。两条路都通，但它选了后者。
+- **Qoder 的 CLI 与 IDE 用两套 MCP 配置**：`~/.qoder/mcp.json` 是 IDE 的，
+  `qodercli` 有自己的一份（`qodercli mcp list` 查看）。只配 IDE 那份时，
+  CLI 会明确告诉你「没有 MCP 工具可用」—— 这个失败是**可见的**，不是静默的。
+
 ### 能力验证
 
 | 项 | 结果 |
@@ -481,6 +517,9 @@ hub 侧走 **CLI 直连**（直接起子进程，零常驻进程）：
 | 项 | 结果 |
 | --- | --- |
 | 并行扇出 | 三路 agent 的 `startedAt` 相差 **3.5 毫秒**（真并行，非伪并行） |
+| **四节点编排** | 4 步 2 层（三路并行读文件 + 汇总），四个 CLI 节点全部参与，61 秒完成；三个并行步的答案与源码逐字一致（证明它们真的读了文件，不是编的） |
+| **模板变量传参** | 汇总步正确拿到三份上游输出并合并 —— `{{steps.x}}` 的数据流通了 |
+| **时长语义** | `a`=14.7s / `b`=21.4s / `c`=6.8s（并行取最大）+ `merge`=39.7s ≈ 总时长 61.1s。汇总步报的是**它自己的** 39.7s，不是整条的 61s |
 | 取消编排 step | `CancelTask` 真的中断下游子进程树；plan 收尾为 `ok=False` 并正常返回 |
 | 失败策略 | 默认 fail-fast；`onError: continue` 可按步覆盖 |
 | 一致性 | 读用快照事务、写用原子合并；跨语句撕裂读有回归测试兜住 |

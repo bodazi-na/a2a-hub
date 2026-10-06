@@ -99,6 +99,29 @@
 | 50 个过程事件落库的事件循环阻塞 | 192.8 ms | **0.9 ms** |
 | 单次 `add_message` | 4.57 ms | ~0.06 ms 量级 |
 
+### 平台接入验证
+
+逐个平台实测「平台 → hub」这条路（不是照着配置推断的），
+验证方式：让每个平台列出 hub 上的 agent 名字 —— 那些名字它猜不出来。
+
+| 平台 | 路径 | 结果 |
+| --- | --- | --- |
+| Claude Code | MCP | ✅ |
+| Qoder CLI | MCP | ✅ |
+| Codex | skill | ✅ |
+| DSH | skill | ✅ |
+| WorkBuddy | skill | ✅ |
+
+过程中修正/发现三件事：
+
+- **Qoder 的 CLI 与 IDE 用两套独立的 MCP 配置**。`~/.qoder/mcp.json` 是 IDE 的；
+  `qodercli` 有自己的一份（`qodercli mcp list` / `mcp add`）。
+  只配 IDE 那份时 CLI 会明确报「没有 MCP 工具可用」。
+- **无头模式下 MCP 工具需要显式放开权限**，否则会被权限提示拦下（无人可确认）。
+  Qoder CLI 用 `--permission-mode auto`。
+- **Codex 实际走的是 skill 而非 MCP** —— 它先试 MCP，然后改用
+  `~/.codex/skills/a2a-hub/scripts/hub_client.py`。两条路都通。
+
 ### 文档
 
 - `docs/architecture.md` —— 分层、数据流、扩展点、数据库

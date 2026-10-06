@@ -1,5 +1,9 @@
 {
-  "_comment": "Qoder：把下面这段合进 ~/.qoder/mcp.json 的 mcpServers，重启 Qoder 生效。",
+  "_comment": "Qoder：**IDE 与 CLI 是两套独立的 MCP 配置**，别只配一个。",
+  "_ide": "IDE：把下面这段合进 ~/.qoder/mcp.json 的 mcpServers，重启 Qoder 生效。",
+  "_cli": "CLI：用 `qodercli mcp add a2a-hub -s user -e PYTHONPATH=<A2A_HUB_DIR> -e HUB_URL=http://127.0.0.1:9200 -- <PYTHON> -m mcp_facade`。用 `qodercli mcp list` 确认（应显示 Connected）。",
+  "_cli_headless": "无头模式还要放开工具权限，否则 MCP 工具会被权限提示拦下、拿不到数据：`qodercli -p --permission-mode auto`。",
+  "_symptom": "只配了 IDE 那份时，`qodercli -p` 会明确说「没有 MCP 工具可用」—— 这个失败是可见的，不是静默的。",
   "mcpServers": {
     "a2a-hub": {
       "command": "<PYTHON>",

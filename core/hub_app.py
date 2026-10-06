@@ -596,7 +596,15 @@ class Hub:
         """
         existing = self.store.get_task(task_id) if task_id else None
         if existing is not None:
+            # 复用编排层预落的占位任务：它的 metadata 里只有 planned/requestedAgent，
+            # 这里补上 planId / stepId，否则 ListTasks 查不到编排归属（审计会缺线索）
             task = existing
+            self.store.update_task(
+                task_id,
+                metadata={**(existing.get("metadata") or {}),
+                          "planId": plan_id, "stepId": step_id,
+                          "requestedAgent": agent},
+            )
         else:
             task = self.store.create_task(
                 context_id=context_id,

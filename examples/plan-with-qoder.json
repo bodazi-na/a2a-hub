@@ -1,0 +1,5 @@
+[
+  {"id": "q", "agent": "qoder-cli", "prompt": "用一句话说明什么是幂等操作。只回复那句话。"},
+  {"id": "c", "agent": "claude-cli", "prompt": "举一个幂等的 HTTP 方法，只回复方法名。"},
+  {"id": "merge", "prompt": "把下面两段合成一行，用 | 分隔，只回复结果：\n{{steps.q}}|{{steps.c}}"}
+]

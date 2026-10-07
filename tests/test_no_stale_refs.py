@@ -67,14 +67,22 @@ def check(name: str, cond: bool, detail: str = "") -> tuple[str, bool]:
 
 
 def tracked_files() -> list[Path]:
-    """优先用 git 列出被追踪的文件（天然排除 dist/build/缓存）。
+    """列出要扫的文件：**已追踪 + 未追踪但不被忽略**。
 
-    不在 git 仓库里（比如从源码包解开）时退化成目录遍历。
+    为什么不能用光秃秃的 `git ls-files`：它**不列未追踪文件**，于是这个测试的
+    结果会取决于「文件提交了没有」—— 一个刚写好、还没 commit 的 `.py` 里若带旧
+    引用，扫描器看不见；等提交之后同一份代码又突然报错。
+
+    这不是假想：**第一版就是这么挂的。** 本地跑（本文件当时未追踪）显示全绿，
+    推上去（已追踪）立刻红 —— 它扫到了自己的文档说明与自检样本。
+    `--others --exclude-standard` 把未追踪但未被忽略的文件也纳入，
+    让「本地」和「CI」看到同一批文件。
     """
     try:
-        out = subprocess.run(["git", "ls-files"], cwd=_REPO, capture_output=True,
-                             text=True, encoding="utf-8", errors="replace",
-                             timeout=30)
+        out = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=_REPO, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30)
         if out.returncode == 0 and out.stdout.strip():
             return [_REPO / p for p in out.stdout.splitlines() if p.strip()]
     except (OSError, subprocess.SubprocessError):
@@ -87,6 +95,10 @@ def tracked_files() -> list[Path]:
     return files
 
 
+# 本文件里有**故意的坏样本**（自检用）和解释性文档，扫自己必然误报。
+_SELF = Path(os.path.abspath(__file__)).resolve()
+
+
 def scan() -> list[str]:
     """返回「文件:行号: 内容」形式的问题清单。"""
     problems = []
@@ -95,6 +107,11 @@ def scan() -> list[str]:
             continue                       # .md 等散文跳过，见模块 docstring
         if SKIP_DIR_PARTS & set(path.parts):
             continue
+        try:
+            if path.resolve() == _SELF:
+                continue                   # 见 _SELF 的说明
+        except OSError:
+            pass
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -149,8 +166,30 @@ def test_scanner_itself_works() -> list:
     ]
 
 
+def test_scanner_ignores_itself() -> list:
+    """扫描器不得把**自己**报成残留。
+
+    这条钉住一个真实踩过的坑：第一版用光秃秃的 `git ls-files`，它不列未追踪
+    文件 —— 本地跑时本文件还没 `git add`，所以「扫不到自己」显示全绿；
+    推上去之后它被追踪了，于是扫到自己的文档说明与自检样本，**CI 立刻红**。
+
+    断言两件事：报告里不出现本文件；且文件清单**确实包含未追踪文件**
+    （否则「本地绿、CI 红」还会再来一次）。
+    """
+    print("\n[自检] 扫描器不扫自己 / 能看到未追踪文件")
+    problems = scan()
+    self_reported = [p for p in problems if "test_no_stale_refs" in p]
+    listed = {p.resolve() for p in tracked_files()}
+    return [
+        check("报告里没有本文件", not self_reported,
+              f"共 {len(self_reported)} 处" if self_reported else ""),
+        check("文件清单包含本文件（说明未追踪的也扫）", _SELF in listed),
+    ]
+
+
 CASES = [
     ("扫描器自检", test_scanner_itself_works),
+    ("不扫自己", test_scanner_ignores_itself),
     ("无残留引用", test_no_stale_refs),
 ]
 

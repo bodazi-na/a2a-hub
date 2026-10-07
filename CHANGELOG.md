@@ -259,7 +259,7 @@ from mcp_facade.server import server      # ← 已收进 a2a_hub.mcp_facade
 往 `sys.path` 里塞路径会把「安装坏了」掩盖成「本地能跑」。另外补一步验证
 命令行入口（`a2a-hub --help` 与 `python -m a2a_hub --help`）都能跑。
 
-**顺带补一条守卫**：`tests/test_no_stale_refs.py`（单元级，3 项断言）。
+**顺带补一条守卫**：`tests/test_no_stale_refs.py`（单元级，5 项断言）。
 
 「重构后残留旧引用」这件事**已经漏了三次** —— `examples/mcp/*` 平台配置、
 `tests/test_mcp_facade.py`、以及这次的 CI。三次都不是难发现，而是**没有任何东西
@@ -268,6 +268,16 @@ from mcp_facade.server import server      # ← 已收进 a2a_hub.mcp_facade
 守卫只扫**非 Markdown** 的可执行/配置文件（README / CHANGELOG / ADR 里会正当
 引用旧写法，扫进去只制造假警报），且只认两种精确形态：导入语句与 `-m <模块>` 调用。
 它自己也带一组坏样本/好样本自检 —— **一个永远返回空清单的扫描器，看起来和全绿一模一样**。
+
+**这条守卫第一次上线时自己也挂了**（把 `unit` 四格弄红），原因值得记：
+
+它用光秃秃的 `git ls-files` 列文件，而**它不列未追踪文件** —— 本地跑时该文件还没
+`git add`，扫不到自己所以全绿；推上去被追踪之后，扫到**自己的文档说明与自检样本**，
+CI 立刻红。修法是两条：扫描器跳过自己；改用
+`--cached --others --exclude-standard`，让「本地」和「CI」看到同一批文件。
+
+> **教训：新增测试要在「CI 的条件」下验，不是在「我本地刚好能跑」的条件下验。**
+> 干净 clone 跑一遍就能发现 —— 而那一步我明明做过一次，这次省了。
 
 ### 性能
 

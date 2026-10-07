@@ -833,6 +833,7 @@ ran**. All five returned the correct list.
 | **Backpressure** | A subscriber that never reads does not stop the task — a slow client only affects itself |
 | **Compatibility** | Old-signature adapters (`call` without `on_event`) work on both paths; the streaming change does not break them |
 | Parallel fan-out | Three agents' `startedAt` differ by **3.5 ms** (genuinely parallel, not fake) |
+| **Layer inference** | 3 parallel tasks + a merge step correctly reported as **2 layers** (`layer0: [a,b,c]` / `layer1: [merge]`), matching the plan. The criterion is the *definition* of strict layering (a new layer only once the previous batch has fully finished), with no empirical threshold — a threshold-based criterion failed in both directions in practice: a layer shorter than the threshold got merged, and dispatch spacing larger than the threshold got split |
 | **Four-node orchestration** | 4 steps, 2 layers (three-way parallel file reading + merge), all four CLI nodes involved, finished in 61 s; the three parallel answers matched the source text verbatim (proving they really read the files rather than making it up) |
 | **Template variables** | The merge step correctly received all three upstream outputs and combined them — `{{steps.x}}` data flow works |
 | **Duration semantics** | `a`=14.7 s / `b`=21.4 s / `c`=6.8 s (parallel takes the max) + `merge`=39.7 s ≈ 61.1 s total. The merge step reports **its own** 39.7 s, not the whole 61 s |
@@ -850,7 +851,7 @@ python tests/run_all.py --all    # add integration (needs real CLIs / a running 
 
 | Tier | Count | Dependencies |
 | --- | --- | --- |
-| Unit | 11 suites | None (fake adapters + in-memory Store) |
+| Unit | 12 suites | None (fake adapters + in-memory Store) |
 | Platform | 1 suite | Spawns real processes, but only `sys.executable`; auto-skips off Windows |
 | Integration | 6 suites | Real CLIs / Windows process commands / a running hub |
 

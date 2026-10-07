@@ -34,8 +34,10 @@ from .base import (
     Adapter,
     CallResult,
     Event,
+    OnEvent,
     pick_session_id,
     pick_usage,
+    utcnow,
 )
 
 CARD_PATH = "/.well-known/agent-card.json"
@@ -199,6 +201,7 @@ class A2AHttpAdapter(Adapter):
         context_id: str | None = None,
         session_id: str | None = None,
         timeout: float | None = None,
+        on_event: OnEvent | None = None,
     ) -> CallResult:
         budget = timeout if timeout is not None else 600.0
         # 截止时间从**调用开始**就建立（A2A-11）。原来是在首次 SendMessage
@@ -245,7 +248,14 @@ class A2AHttpAdapter(Adapter):
                 event = _history_entry_to_event(history[seen])
                 seen += 1
                 if event is not None:
+                    # 轮询模式下时间戳只能取「这一轮拉到的时刻」——
+                    # 下游没在 history 里带自己的时间戳，我们无从得知真实发生时刻。
+                    # 但至少不再是「整轮结束后的落库时刻」，轮询间隔级别的时序能还原。
+                    if event.ts is None:
+                        event.ts = utcnow()
                     events.append(event)
+                    if on_event is not None:
+                        await on_event(event)
 
             if state in TERMINAL_STATES or loop.time() >= deadline:
                 break

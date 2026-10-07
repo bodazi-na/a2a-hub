@@ -44,8 +44,10 @@ from .base import (
     Adapter,
     CallResult,
     Event,
+    OnEvent,
     pick_session_id,
     pick_usage,
+    utcnow,
 )
 
 # 进程被 kill 后，等待它真正退出（避免僵尸进程）
@@ -407,6 +409,7 @@ class CLIAdapter(Adapter):
         context_id: str | None = None,
         session_id: str | None = None,
         timeout: float | None = None,
+        on_event: OnEvent | None = None,
     ) -> CallResult:
         try:
             argv = self._argv(*self.build_argv(session_id or None))
@@ -467,7 +470,9 @@ class CLIAdapter(Adapter):
             # 下游若不消费 stdin 且 prompt 超过管道容量，drain() 会永久阻塞，
             # 而这一步原来在 wait_for 之外，超时根本管不到它。
             await asyncio.wait_for(self._feed_stdin(proc, prompt), timeout=remaining())
-            await asyncio.wait_for(self._consume(proc, state, events), timeout=remaining())
+            await asyncio.wait_for(
+                self._consume(proc, state, events, on_event), timeout=remaining()
+            )
         except asyncio.TimeoutError:
             problems = await self._kill(proc, job)
             return CallResult(
@@ -507,7 +512,11 @@ class CLIAdapter(Adapter):
         )
 
     async def _consume(
-        self, proc: asyncio.subprocess.Process, state: dict[str, Any], events: list[Event]
+        self,
+        proc: asyncio.subprocess.Process,
+        state: dict[str, Any],
+        events: list[Event],
+        on_event: OnEvent | None = None,
     ) -> None:
         """读 stdout 的事件流；stderr 单独收尾（用于失败诊断）。"""
         assert proc.stdout is not None
@@ -522,7 +531,7 @@ class CLIAdapter(Adapter):
 
         stderr_task = asyncio.create_task(drain_stderr())
         try:
-            await self._read_lines(proc.stdout, state, events)
+            await self._read_lines(proc.stdout, state, events, on_event)
             await proc.wait()
         finally:
             stderr_task.cancel()
@@ -534,6 +543,7 @@ class CLIAdapter(Adapter):
     async def _read_lines(
         self, stream: asyncio.StreamReader, state: dict[str, Any],
         events: list[Event],
+        on_event: OnEvent | None = None,
     ) -> None:
         """按块读、自己切行 —— 刻意**不走 `readline()`**。
 
@@ -558,10 +568,26 @@ class CLIAdapter(Adapter):
         skipping = False          # 正在丢弃一条超长行的剩余部分
         pending: list[str] = []   # 跨行 JSON 重组缓冲
         pending_bytes = 0
+        # 已交给回调的条数。回调是 async 而 emit 是 sync（它被切行循环同步调用），
+        # 所以 emit 只登记、由外层 async 循环按块排空 —— 顺序与 events 一致。
+        notified = 0
 
         def emit(obj: dict[str, Any]) -> None:
             for event in self.parse_line(obj, state) or []:
+                # **发生时刻**，在这里打上 —— 只有这里知道「事件是什么时候到的」。
+                # 落到调用方去打就成了落库时刻，一批事件的时间戳会全挤在几毫秒内（N5）。
+                if event.ts is None:
+                    event.ts = utcnow()
                 events.append(event)
+
+        async def flush_events() -> None:
+            """把新登记的事件逐条交给回调，保持顺序。"""
+            nonlocal notified
+            while notified < len(events):
+                event = events[notified]
+                notified += 1
+                if on_event is not None:
+                    await on_event(event)
 
         def note_noise(line: str) -> None:
             state["noise_total"] += 1
@@ -633,12 +659,16 @@ class CLIAdapter(Adapter):
                     skipping = False        # 这条超长行的尾巴，丢掉
                     continue
                 feed(line.decode("utf-8", "replace").strip())
+            # 每读完一个块就排空一次回调 —— 这是「实时」的落点：
+            # 下游还在跑，事件已经推给订阅者了，不必等整轮结束。
+            await flush_events()
 
         if buf and not skipping:
             feed(buf.decode("utf-8", "replace").strip())
         if pending:
             # EOF 时还攒着 —— 拼不成，如实计数（P2-24）
             state["unparsed"] += len(pending)
+        await flush_events()
 
     @staticmethod
     def _try_json(line: str) -> dict[str, Any] | None:

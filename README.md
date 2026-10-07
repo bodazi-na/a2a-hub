@@ -33,8 +33,9 @@
 | **持久化** | SQLite 六表（tasks / messages / artifacts / contexts / agents / schema_version），WAL 模式 |
 | **注册与发现** | Agent Card 注册表，落库；健康探测走 HTTP 拉卡片 |
 | **路由** | 按 agent 名或能力标签（tag / Agent Card 里的 skills）选节点 |
-| **A2A 服务端** | 对外暴露 Agent Card + JSON-RPC（SendMessage / GetTask / ListTasks / CancelTask） |
+| **A2A 服务端** | 对外暴露 Agent Card + JSON-RPC（SendMessage / **SendStreamingMessage** / GetTask / ListTasks / CancelTask） |
 | **过程回传** | 下游的 thinking / tool_call / tool_result / text 统一映射成消息落库 |
+| **实时流** | `SendStreamingMessage`（SSE）；事件在**发生那一刻**推送，时间戳是发生时刻而非落库时刻 |
 
 **核心设计：先落库，再派活。** 任务在任何下游动作之前就已经写进 SQLite，所以进程崩了、重启了，任务状态依然查得到；下游失败也不会丢任务，只会置为 `failed` 并记下原因。
 
@@ -388,6 +389,45 @@ python hub.py serve --host 127.0.0.1 --port 9200
 
 facade 连不上 hub 时会返回明确的错误提示（含「请先运行 hub.py serve」），不会静默失败。
 
+## 实时流（SSE）
+
+hub 实现了 A2A 的 `SendStreamingMessage`，Agent Card 如实声明
+`capabilities.streaming = true`。
+
+```bash
+curl -N -X POST http://127.0.0.1:9200/ \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendStreamingMessage",
+       "params":{"agent":"dsh-cli",
+                 "message":{"messageId":"m1","role":"ROLE_USER",
+                            "parts":[{"text":"帮我查一下 xxx"}]}}}'
+```
+
+事件体是**标准 A2A `StreamResponse`**（`statusUpdate` / `task`），所以纯 A2A
+客户端不需要认识任何扩展就能解析：
+
+```
+data: {"jsonrpc":"2.0","id":"1","result":{"statusUpdate":{...状态=working...}}}
+data: {"jsonrpc":"2.0","id":"1","result":{"statusUpdate":{...一条过程事件...}}}
+data: {"jsonrpc":"2.0","id":"1","result":{"task":{...终态 + 产物...}}}
+```
+
+**为什么值得单独说**：过程事件以前是 `adapter.call` **跑完之后**才批量落库的，
+时间戳全是插入时刻 —— 实测一个跑了 181 秒的任务，它全部过程事件的时间戳挤在
+64 毫秒之内。控制台把那段渲染成「时间线」，**声明诚实、呈现误导**。
+现在事件在**发生那一刻**就推出去，时间戳也是发生时刻，时序是真的。
+
+三个设计取舍：
+
+| 取舍 | 为什么 |
+| --- | --- |
+| 载荷用标准 `StreamResponse`，过程事件的语义放进 `metadata.kind` | A2A 没有「thinking / tool_call」这类类型，最贴近的载体是 `status.message`。这样**不认识我们的客户端也能当进度消息正常显示** |
+| 订阅队列**有界**，满了丢最老的并计数 | 慢客户端（浏览器卡住）绝不能反过来拖住正在跑的任务。丢了多少会随流送出去，客户端能标出断点而不是被无声骗过 |
+| 心跳用 SSE 注释行（`: keep-alive`） | agent 想几分钟是常态，不发心跳会被中间层掐连接。注释行不污染数据 |
+
+带 `taskId` 而不带 `message` 时，是**接入一个已在跑的任务**：先回放历史，
+再跟着推。控制台刷新页面后重新接上靠的就是这个。
+
 ## 控制台
 
 浏览器打开 `http://127.0.0.1:9200/console`。
@@ -397,11 +437,15 @@ facade 连不上 hub 时会返回明确的错误提示（含「请先运行 hub.
 
 | 视图 | 内容 |
 | --- | --- |
+| **实时** | 选一个 agent、输入任务，**边跑边看**每个动作。SSE 驱动，事件在发生那一刻出现 |
 | **概览** | 统计卡片 + 最近 trace + 最近任务 |
 | **注册表** | 每个 agent 的 kind / health / tags / endpoint，可一键「探测全部」 |
 | **Trace** | trace 列表 → 选中后展示**甘特图 + 完整时间线** |
 
 甘特图按任务真实起止时间绘制，所以**并行段一眼可见** —— 同层的两个 agent 会显示为同一水平区间的两条并排条。
+
+「实时」页用 `fetch` + `ReadableStream` 读 SSE 而**不是** `EventSource`：
+后者只能发 GET，带不了 message 体。
 
 **能力边界**：只读 + 触发健康探测。不做启用/禁用 agent、不取消任务 ——
 控制台一旦能写就得配鉴权，那是另一个量级的事。
@@ -538,6 +582,10 @@ hub 侧走 **CLI 直连**（直接起子进程，零常驻进程）：
 
 | 项 | 结果 |
 | --- | --- |
+| **实时流** | 用真实 CLI 下游（dsh）实测：**35 帧、跨度 17.90 秒，帧是分散到达的**。关键证据是帧到达时刻与事件发生时刻几乎重合（到达 13.58s ↔ 事件 ts 40.792；到达 15.00s ↔ ts 42.208，间隔都是 ~1.42 秒）—— 说明延迟极小，确实是「发生即推送」。修复前这一整段会在结束时**一次性涌到** |
+| **事件时间戳** | 落库的 `created_at` 就是事件发生时刻（不再是一批挤在几毫秒内） |
+| **背压** | 订阅者全程不读，任务照常跑完 —— 慢客户端只影响自己 |
+| **兼容性** | 老签名适配器（`call` 无 `on_event`）两条路径都正常，不会被流式改动弄挂 |
 | 并行扇出 | 三路 agent 的 `startedAt` 相差 **3.5 毫秒**（真并行，非伪并行） |
 | **四节点编排** | 4 步 2 层（三路并行读文件 + 汇总），四个 CLI 节点全部参与，61 秒完成；三个并行步的答案与源码逐字一致（证明它们真的读了文件，不是编的） |
 | **模板变量传参** | 汇总步正确拿到三份上游输出并合并 —— `{{steps.x}}` 的数据流通了 |
@@ -556,7 +604,7 @@ python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑�
 
 | 档 | 数量 | 依赖 |
 | --- | --- | --- |
-| 单元级 | 10 套 | 无（假适配器 + 内存 Store） |
+| 单元级 | 11 套 | 无（假适配器 + 内存 Store） |
 | 平台级 | 1 套 | 会起真实进程，但只用 `sys.executable`；非 Windows 自动跳过 |
 | 集成级 | 6 套 | 真实 CLI / Windows 进程命令 / hub 在跑 |
 
@@ -576,9 +624,10 @@ python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑�
 
 - **只实现 Windows**。接口是平台无关的，但 Job Object、`cmd.exe` 包裹、
   `taskkill` 兜底这些只在 Windows 上验证过。非 Windows 下 CLI 适配器未经测试。
-- **不做流式**。Agent Card 里声明 `streaming: false` —— 过程回传是
-  `adapter.call` 跑完之后一次性批量落库的，不是实时流。所以审计时间线
-  **能还原顺序，不能用来分析时序**。
+- **流式已实现，但下游差异会体现在时间戳精度上**。CLI 类下游走
+  `SendStreamingMessage`（SSE）时，事件时间戳是**真实发生时刻**；
+  HTTP 类下游走轮询，时间戳只能取「这一轮拉到的时刻」，精度受轮询间隔限制。
+  历史任务（本版本之前跑的）时间戳是批量写入时刻，**不能用来看时序**。
 - **`RunPlan` 是同步阻塞的**。长编排会超过客户端超时，届时你拿不到结果也拿不到
   `planId`。用 `tools/run_plan.py`（超时可配 + 结果落盘）。
 - **各节点写盘能力不一致且不可声明**。codex-cli 是沙箱只读、qoder-cli 会等人

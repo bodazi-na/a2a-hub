@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import json
 import math
 import uuid
@@ -45,14 +46,14 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from adapters.base import Adapter
 from core.orchestrator import Orchestrator, PlanError
 from core.registry import Registry
 from core.router import NoRouteError, Router
-from core.store import Store
+from core.store import Store, new_id
 
 HUB_NAME = "a2a-hub"
 HUB_VERSION = "0.2.0"
@@ -60,6 +61,7 @@ HUB_DESCRIPTION = "多 Agent A2A 协调内核：注册、路由、持久化"
 
 # 内部小写状态 → A2A 协议状态
 STATE_MAP = {
+
     "submitted": "TASK_STATE_SUBMITTED",
     "working": "TASK_STATE_WORKING",
     "completed": "TASK_STATE_COMPLETED",
@@ -68,6 +70,74 @@ STATE_MAP = {
 }
 
 ACTIVE_STATES = ("submitted", "working")
+
+# 每个实时流订阅者的队列上限。256 条足够覆盖「客户端卡一下」的抖动，
+# 又不至于让一个僵死的连接在内存里囤积无界的事件。
+SSE_QUEUE_MAX = 256
+# 流的心跳间隔（秒）。没有它，中间的代理/浏览器会把「长时间没数据」的连接掐掉 ——
+# 而 agent 跑几分钟不出事件是常态（模型在思考）。用 SSE 注释行做心跳，不污染数据。
+SSE_HEARTBEAT_SECONDS = 15.0
+
+SSE_HEADERS = {
+    # `no-transform` + `X-Accel-Buffering: no` 是给中间层看的：
+    # 少了它们，nginx 之类的反代会攒够一个缓冲块才吐出去，实时性直接没了。
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
+def _sse_frame(req_id: Any, result: dict[str, Any]) -> str:
+    """拼一个 SSE 帧。
+
+    载荷是**标准 JSON-RPC 响应**，`result` 用 A2A 的 `StreamResponse` 形态
+    （`statusUpdate` / `task`）—— 所以纯 A2A 客户端不需要认识我们的扩展，
+    照规范解析就能用。
+    """
+    payload = {"jsonrpc": "2.0", "id": req_id, "result": result}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _message_text(msg: dict[str, Any]) -> str:
+    """从落库的消息里取纯文本（content 是 parts 数组）。"""
+    parts = msg.get("content")
+    if isinstance(parts, list):
+        return "".join(
+            str(p.get("text", "")) for p in parts if isinstance(p, dict)
+        )
+    return str(parts or "")
+
+
+async def _single_frame_stream(req_id: Any, task: dict[str, Any]):
+    """把「准备阶段就失败」也包成一条合法的事件流。"""
+    yield _sse_frame(req_id, {"task": task})
+
+
+# 适配器的 call 是否接受 on_event —— 按**类**缓存（同类实例签名一样）。
+#
+# 这是**兼容性护栏**：`on_event` 是后加的，而 `Adapter.call` 是抽象方法，
+# 每个适配器都自己写签名。第三方适配器很可能还是老签名，直接传会
+# `TypeError: got an unexpected keyword argument` —— 任务**直接失败**，
+# 而它本该只是「没有流式」而已。
+#
+# 所以探一次、缓存起来，不支持就不传：老适配器行为**完全不变**，
+# 只是推不了实时事件（同步调用方本来也不需要流）。
+_ACCEPTS_ON_EVENT: dict[type, bool] = {}
+
+
+def _accepts_on_event(adapter: Any) -> bool:
+    cls = type(adapter)
+    cached = _ACCEPTS_ON_EVENT.get(cls)
+    if cached is None:
+        try:
+            params = inspect.signature(adapter.call).parameters
+            cached = "on_event" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):
+            cached = False
+        _ACCEPTS_ON_EVENT[cls] = cached
+    return cached
 
 
 # 用量字段的命名在各家 CLI 之间不统一（dsh 用 inputTokens，codex 用 input_tokens，
@@ -269,6 +339,24 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class _Subscriber:
+    """一个实时流的订阅者。
+
+    队列**有界**是刻意的：订阅者（通常是控制台）读得慢时，不能反过来把
+    任务执行拖住 —— 生产者是「正在跑下游 CLI 的那条协程」，它被卡住等于
+    整个任务被一个看热闹的客户端拖慢。
+
+    满了就**丢最老的**，让最新的总能进来，同时记下丢了多少条。这个数字会
+    随流送出去，客户端因此知道「中间有缺口」，而不是被无声地骗过去。
+    """
+
+    __slots__ = ("queue", "dropped")
+
+    def __init__(self, maxsize: int = SSE_QUEUE_MAX) -> None:
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self.dropped = 0
+
+
 class Hub:
     """把 store / registry / router / adapters 组装成一个可服务的对象。"""
 
@@ -298,6 +386,8 @@ class Hub:
         self._running: dict[str, asyncio.Task] = {}
         # 按 (contextId, agent) 的会话锁，防止并发请求从同一旧 session 分叉
         self._context_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # 实时事件总线：task_id -> 订阅者集合（见 subscribe/_publish）
+        self._subs: dict[str, set[_Subscriber]] = {}
         self._sem: asyncio.Semaphore | None = None
         self.orchestrator = Orchestrator(self)
         self.auth_token = (auth_token or "").strip() or None
@@ -321,6 +411,95 @@ class Hub:
         return self._sem
 
     # ------------------------------------------------------------------
+    # 实时事件总线
+    #
+    # 一个进程内的 pub/sub：任务执行时把过程事件推给订阅者（SSE 客户端）。
+    # **刻意不做成持久队列** —— 持久化由 store 负责，总线只是「同一时刻正在看
+    # 这条任务的人」的广播。所以重启丢订阅是对的，不该假装能恢复。
+    # ------------------------------------------------------------------
+
+    def subscribe(self, task_id: str) -> _Subscriber:
+        sub = _Subscriber()
+        self._subs.setdefault(task_id, set()).add(sub)
+        return sub
+
+    def unsubscribe(self, task_id: str, sub: _Subscriber) -> None:
+        subs = self._subs.get(task_id)
+        if not subs:
+            return
+        subs.discard(sub)
+        if not subs:
+            self._subs.pop(task_id, None)
+
+    def _publish(self, task_id: str, payload: dict[str, Any]) -> None:
+        """把一条事件推给该任务的所有订阅者。
+
+        **绝不阻塞、绝不抛异常** —— 它跑在任务执行的关键路径上，这里出任何
+        问题都会把任务本身弄挂。慢订阅者只会丢自己的事件（见 `_Subscriber`）。
+        """
+        subs = self._subs.get(task_id)
+        if not subs:
+            return
+        for sub in list(subs):
+            try:
+                sub.queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                # 丢最老的、给新的腾位置：宁可让客户端看到「最近发生了什么」，
+                # 也不要让它看到「很久以前发生了什么」而错过当下。
+                try:
+                    sub.queue.get_nowait()
+                    sub.dropped += 1
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    sub.queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
+
+    @staticmethod
+    def _status_update(
+        task_id: str,
+        context_id: str,
+        state: str,
+        *,
+        text: str | None = None,
+        kind: str | None = None,
+        ts: str | None = None,
+        dropped: int = 0,
+    ) -> dict[str, Any]:
+        """构造 A2A 的 `TaskStatusUpdateEvent`。
+
+        过程事件（thinking / tool_call / …）在 A2A 里没有专门的类型，
+        规范内最贴近的载体是 `status.message` —— 所以它们统一以
+        `state=working` + 一条 message 的形式送出，事件的语义放进 `metadata.kind`。
+        这样**纯 A2A 客户端即使不认识我们的 kind，也能把它当进度消息正常显示**。
+        """
+        status: dict[str, Any] = {"state": state}
+        if text:
+            status["message"] = {
+                "messageId": new_id(),
+                "role": "ROLE_AGENT",
+                "parts": [{"text": text}],
+            }
+        meta: dict[str, Any] = {}
+        if kind:
+            meta["kind"] = kind
+        if ts:
+            meta["ts"] = ts
+        if dropped:
+            # 如实告知「中间丢了 N 条」—— 客户端据此可以在 UI 上打个断点标记，
+            # 而不是以为自己看到的是完整的。
+            meta["dropped"] = dropped
+        return {
+            "statusUpdate": {
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": status,
+                **({"metadata": meta} if meta else {}),
+            }
+        }
+
+    # ------------------------------------------------------------------
     # HTTP 端点
     # ------------------------------------------------------------------
 
@@ -342,7 +521,10 @@ class Hub:
                 },
             ],
             "capabilities": {
-                "streaming": False,
+                # 以前这里是 False —— 过程事件是 `adapter.call` 跑完后批量落库的，
+                # 声明成流式就是撒谎。现在真的实现了 SSE（SendStreamingMessage），
+                # 事件在**发生那一刻**推出去，可以如实声明（N5）。
+                "streaming": True,
                 "pushNotifications": False,
             },
             "defaultInputModes": ["text"],
@@ -486,8 +668,7 @@ class Hub:
         handlers = {
             "SendMessage": self._send_message,
             "message/send": self._send_message,          # A2A 0.3 兼容别名
-            "GetTask": self._get_task,
-            "tasks/get": self._get_task,
+            "GetTask": self._get_task,            "tasks/get": self._get_task,
             "ListTasks": self._list_tasks,
             "tasks/list": self._list_tasks,
             "CancelTask": self._cancel_task,
@@ -500,8 +681,12 @@ class Hub:
             "ListTraces": self._list_traces,
         }
         handler = handlers.get(method)
-        if handler is None:
+        if handler is None and method not in ("SendStreamingMessage", "message/stream"):
             return self._rpc_error(req_id, -32601, f"Method not found: {method}")
+        # 流式单独分流：它的签名与其它方法不同（要返回 StreamingResponse 而不是
+        # dict），塞进 handlers 表会让调用方对返回类型的假设失效。
+        if method in ("SendStreamingMessage", "message/stream"):
+            return await self._send_streaming_message(req_id, params)
         try:
             result = await handler(params)
         except NoRouteError as exc:
@@ -516,15 +701,23 @@ class Hub:
     # JSON-RPC 方法
     # ------------------------------------------------------------------
 
-    async def _send_message(self, params: dict[str, Any]) -> dict[str, Any]:
-        message = params.get("message") or {}
+    async def _prepare_task(
+        self, params: dict[str, Any], message: dict[str, Any]
+    ) -> Any:
+        """落库 + 路由 + 组装派活参数。`SendMessage` 与 `SendStreamingMessage` 共用。
+
+        返回 `(task_id, context_id, args)`；失败时返回 `{"task": ...}` 结果字典
+        （调用方直接把它当返回值即可 —— 任务已落成 failed，错误在 task 里）。
+
+        抽出来是为了让两条路径**不可能分叉**：同步与流式各写一份落库/路由，
+        迟早出现「一个修了另一个没修」。
+        """
         context_id = message.get("contextId") or params.get("contextId") or ""
         prompt = "".join(
             str(part.get("text", ""))
             for part in (message.get("parts") or [])
             if isinstance(part, dict)
         )
-        want_async = bool(params.get("async"))
         # 参数校验必须在落库之前 —— 否则非法 timeout 会留下一个
         # 没人执行的 submitted 孤儿任务（A2A-10）
         timeout = parse_timeout(params.get("timeout"))
@@ -539,7 +732,7 @@ class Hub:
             trace_id=trace_id,
             metadata={
                 "requestedAgent": params.get("agent"),
-                "async": want_async,
+                "async": bool(params.get("async")),
             },
         )
         task_id = task["id"]
@@ -564,12 +757,22 @@ class Hub:
             self.store.update_task(task_id, state="failed", error=err, finished=True)
             return {"task": self._task_payload(task_id)}
 
-        timeout = parse_timeout(params.get("timeout"))
         session_id = (
             self.store.get_context_session(context_id, record.name)
             if context_id else None
         )
-        args = (task_id, record, adapter, prompt, context_id, session_id, timeout)
+        return task_id, context_id, (
+            task_id, record, adapter, prompt, context_id, session_id, timeout
+        )
+
+    async def _send_message(self, params: dict[str, Any]) -> dict[str, Any]:
+        message = params.get("message") or {}
+        want_async = bool(params.get("async"))
+        prepared = await self._prepare_task(params, message)
+        if isinstance(prepared, dict):
+            return prepared
+        task_id, _context_id, args = prepared
+        record = args[1]
 
         # 3) 异步模式：转后台，立即返回
         if want_async:
@@ -595,6 +798,124 @@ class Hub:
             await asyncio.gather(bg, return_exceptions=True)
             raise
         return {"task": self._task_payload(task_id)}
+
+    # ------------------------------------------------------------------
+    # 流式（SSE）
+    # ------------------------------------------------------------------
+
+    async def _send_streaming_message(
+        self, req_id: Any, params: dict[str, Any]
+    ) -> Any:
+        """A2A `SendStreamingMessage`：以 `text/event-stream` 持续推送任务进展。
+
+        两种用法：
+
+        - 带 `message`：新建任务并立即执行，边跑边推（最常用）
+        - 带 `taskId`：**接入一个已在跑的任务**，先回放历史再跟着推 ——
+          控制台刷新页面后重新接上，靠的就是这个
+
+        为什么值得有它：以前过程事件是 `adapter.call` **跑完之后**才批量落库的，
+        时间戳全是插入时刻（实测 qoder 真跑了 181 秒，事件却挤在 64 毫秒内）。
+        控制台把那段渲染成 timeline，**声明诚实、呈现误导**（N5）。
+        流式之后事件在**发生那一刻**就出去了，时序是真的。
+        """
+        message = params.get("message") or {}
+        attach_id = params.get("taskId") or params.get("id")
+        if not message and not attach_id:
+            return self._rpc_error(req_id, -32602, "需要 message 或 taskId")
+
+        dispatch: tuple | None = None
+        if message:
+            prepared = await self._prepare_task(params, message)
+            if isinstance(prepared, dict):
+                # 落库/路由阶段就失败了。任务已是终态 —— 仍然用**流式形态**回一次，
+                # 免得客户端明明请求的是 event-stream 却收到 JSON 解析不了，
+                # 反而把「路由不到」这个明确原因盖掉。
+                return StreamingResponse(
+                    _single_frame_stream(req_id, prepared["task"]),
+                    media_type="text/event-stream",
+                    headers=SSE_HEADERS,
+                )
+            task_id, context_id, args = prepared
+            dispatch = args
+        else:
+            task = self.store.get_task(attach_id)
+            if task is None:
+                return self._rpc_error(req_id, -32004, f"task not found: {attach_id}")
+            task_id = attach_id
+            context_id = task.get("context_id") or ""
+
+        # **先订阅再派活/回放**：反过来的话，两步之间产生的事件会永久丢失。
+        # 代价是可能重复，所以回放时记下 (kind, ts)，把队列里已出现过的丢掉。
+        sub = self.subscribe(task_id)
+
+        async def gen():
+            try:
+                seen: set[tuple[str, str]] = set()
+                # 1) 回放已落库的历史（跳过那条 user 消息 —— 它是输入，不是过程）
+                for msg in self.store.list_messages(task_id):
+                    if msg.get("role") == "user":
+                        continue
+                    key = (msg.get("kind") or "", msg.get("created_at") or "")
+                    seen.add(key)
+                    yield _sse_frame(req_id, self._status_update(
+                        task_id, context_id, "TASK_STATE_WORKING",
+                        text=_message_text(msg), kind=msg.get("kind"),
+                        ts=msg.get("created_at"),
+                    ))
+                # 2) 回放期间新到的事件：去重后补上
+                while not sub.queue.empty():
+                    payload = sub.queue.get_nowait()
+                    key = (payload.get("kind") or "", payload.get("ts") or "")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    yield _sse_frame(req_id, self._status_update(
+                        task_id, context_id, "TASK_STATE_WORKING",
+                        text=payload.get("text"), kind=payload.get("kind"),
+                        ts=payload.get("ts"), dropped=sub.dropped,
+                    ))
+                # 3) 已经终态就不必再等了（「接入一个跑完的任务」是合法用法）
+                if self._is_terminal(task_id):
+                    yield _sse_frame(req_id, {"task": self._task_payload(task_id)})
+                    return
+                # 4) 派活（新任务）。放在订阅之后，头几条事件不会漏
+                if dispatch is not None:
+                    bg = asyncio.create_task(self._execute(*dispatch))
+                    self._running[task_id] = bg
+                    bg.add_done_callback(
+                        lambda _t, tid=task_id: self._running.pop(tid, None)
+                    )
+                # 5) 实时
+                while True:
+                    try:
+                        payload = await asyncio.wait_for(
+                            sub.queue.get(), timeout=SSE_HEARTBEAT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        # 心跳：agent 思考几分钟是常态，不心跳会被中间层掐连接。
+                        # 用 SSE 注释行，不污染数据。
+                        yield ": keep-alive\n\n"
+                        continue
+                    if payload.get("terminal"):
+                        yield _sse_frame(req_id, {"task": self._task_payload(task_id)})
+                        return
+                    yield _sse_frame(req_id, self._status_update(
+                        task_id, context_id, "TASK_STATE_WORKING",
+                        text=payload.get("text"), kind=payload.get("kind"),
+                        ts=payload.get("ts"), dropped=sub.dropped,
+                    ))
+            finally:
+                # 客户端断线 / 正常结束都要退订，否则订阅者集合会越积越多
+                self.unsubscribe(task_id, sub)
+
+        return StreamingResponse(
+            gen(), media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
+    def _is_terminal(self, task_id: str) -> bool:
+        task = self.store.get_task(task_id)
+        return bool(task) and task.get("state") not in ACTIVE_STATES
 
     async def dispatch_task(
         self,
@@ -715,6 +1036,18 @@ class Hub:
         # 带 only_from：任务若在派活前就已被取消，不该再补 started_at。
         self.store.update_task(task_id, started=True, only_from=ACTIVE_STATES)
 
+        # 实时事件回调：下游每解析出一条过程事件就立刻推给订阅者。
+        # **它不替代持久化** —— 事件照常收集进 result.events 并落库。流只是
+        # 「额外多一条路」：订阅者断线不影响任务，任务结束也不影响订阅者。
+        async def _on_event(event: Any) -> None:
+            self._publish(task_id, {
+                "kind": event.kind, "text": event.text, "ts": event.ts,
+            })
+
+        # 老签名的适配器不传 on_event（见 _accepts_on_event 的说明）——
+        # 它们照常工作，只是没有实时流。
+        stream_kwargs = {"on_event": _on_event} if _accepts_on_event(adapter) else {}
+
         lock = self._context_lock(context_id, record.name) if context_id else None
         acquired = False
         try:
@@ -748,6 +1081,10 @@ class Hub:
                     content=[{"text": f"dispatched to {record.name}"}],
                     metadata={"agent": record.name, "endpoint": record.endpoint},
                 )
+                self._publish(task_id, {
+                    "kind": "status", "state": "working",
+                    "text": f"dispatched to {record.name}",
+                })
                 # 拿锁之后再读 session，保证读到的是最新的
                 if context_id:
                     session_id = self.store.get_context_session(context_id, record.name)
@@ -756,6 +1093,7 @@ class Hub:
                     context_id=context_id or None,
                     session_id=session_id,
                     timeout=timeout,
+                    **stream_kwargs,
                 )
                 # 续接失败要能自愈。
                 #
@@ -782,6 +1120,7 @@ class Hub:
                         context_id=context_id or None,
                         session_id=None,
                         timeout=timeout,
+                        **stream_kwargs,
                     )
                 # 会话映射的写回也在锁内 —— 出锁即已落库
                 if context_id and result.session_id:
@@ -800,6 +1139,10 @@ class Hub:
             self.store.update_task(task_id, state="canceled",
                                    error="canceled by caller", finished=True,
                                    only_from=ACTIVE_STATES)
+            # 取消也要收尾流 —— 否则订阅者会一直挂着等一个永不到来的终态
+            self._publish(task_id, {
+                "state": "canceled", "text": "canceled by caller", "terminal": True,
+            })
             raise
         except Exception as exc:  # noqa: BLE001
             detail = f"{type(exc).__name__}: {exc}"
@@ -814,6 +1157,9 @@ class Hub:
                     task_id, role="agent", kind="error",
                     content=[{"text": f"结算阶段出错，但任务已由其它路径结算：{detail}"}],
                 )
+            self._publish(task_id, {
+                "state": "failed", "text": detail, "terminal": True,
+            })
         finally:
             # **只在确实拿到了锁时才释放**。acquire() 被取消时锁并未归我们，
             # 无条件 release() 会抛 "Lock is not acquired"，更糟的是——
@@ -859,6 +1205,10 @@ class Hub:
                     "kind": event.kind,
                     "content": [{"text": event.text}],
                     "metadata": event.metadata,
+                    # **用事件的发生时刻**，不是落库时刻。适配器在解析出这条事件
+                    # 时就打好了 ts；以前这里不传，store 统一填「插入时刻」，
+                    # 于是整批事件的时间戳挤在几毫秒内，时序全丢（N5）。
+                    "created_at": event.ts,
                 }
                 for event in result.events
             ])
@@ -878,6 +1228,14 @@ class Hub:
             self.store.update_task(task_id, state="failed",
                                    error=result.error or "unknown failure",
                                    finished=True, only_from=ACTIVE_STATES)
+
+        # 终态推给订阅者。**放在最后** —— 订阅者收到它就知道流该结束了，
+        # 所以必须等产物也落完，否则客户端拿到 task 时 artifact 还没写进去。
+        self._publish(task_id, {
+            "state": "completed" if result.ok else "failed",
+            "text": None if result.ok else (result.error or "unknown failure"),
+            "terminal": True,
+        })
 
     async def _get_task(self, params: dict[str, Any]) -> dict[str, Any]:
         task_id = params.get("id") or params.get("taskId")

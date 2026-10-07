@@ -12,6 +12,7 @@
 | [004](004-job-object-for-process-tree.md) | 用 Job Object 回收进程树，`taskkill` 降为兜底 | 句柄语义消除 PID 复用的 TOCTOU；能收掉 `/T` 够不着的孙进程 |
 | [005](005-no-to-thread-for-store.md) | **不**把 Store 改造成 `asyncio.to_thread` | 实测根因是一次 fsync，改 PRAGMA 就拿到 64 倍 —— 重构不划算且新增竞态面 |
 | [006](006-explicit-transactions.md) | 多语句读写显式包事务；事务不可重入 | 读用快照事务、写用 `_write_txn`、改 metadata 用原子合并 |
+| [007](007-streaming-bounded-queue.md) | 实时流用**有界队列 + 丢最老**做背压 | 慢客户端只影响自己，绝不拖住正在跑的任务；丢了多少随流送出 |
 
 ## 怎么写一条新 ADR
 

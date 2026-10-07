@@ -61,11 +61,13 @@ adapters 吃掉每个工具的差异。**新增一种执行体 = 新增一个 `A
    ├─④ 抢状态                          update_task(state=working, only_from=(…))
    │     _updated=False ⇒ 任务已被取消/终态 ⇒ **不派活**
    │
-   ├─⑤ 派活                            adapter.call(prompt, session_id=…)
+   ├─⑤ 派活                            adapter.call(prompt, session_id=…, on_event=…)
    │     CLI 系：起子进程 · 写 stdin · 读事件流 · 收进 Job Object
+   │     on_event 给了 ⇒ 每解析出一条事件**立刻**推给订阅者（流式）
    │
    ├─⑥ 结算                            _settle_result()
    │     先抢终态（only_from 裁决）→ 抢到才写过程事件与 artifact
+   │     过程事件带**自己的发生时刻**落库（不是落库时刻）
    │
    └─⑦ 返回 A2A task payload
 ```
@@ -75,6 +77,37 @@ adapters 吃掉每个工具的差异。**新增一种执行体 = 新增一个 `A
 - ①在②③之前 —— 路由失败也要留下任务记录（`failed` + 原因），不能「任务凭空消失」
 - ④在⑤之前 —— 否则取消拦不住下游，会派活、产生真实副作用却永不落库
 - ⑥先抢终态再写产物 —— 反过来会留下「已取消却带 response artifact」的假象
+
+## 实时流（SSE）
+
+```
+客户端 SendStreamingMessage
+   │
+   ├─① 与 SendMessage 完全同一条准备路径（_prepare_task，两条路不会分叉）
+   │
+   ├─② **先订阅**（hub.subscribe(task_id)）
+   │     反过来的话，订阅与派活之间产生的事件会永久丢失
+   │
+   ├─③ 回放已落库的历史（接入已有任务时用）
+   │     订阅在先 ⇒ 可能重复 ⇒ 回放时记 (kind, ts) 去重
+   │
+   ├─④ 派活（后台）
+   │     adapter 每解析出一条事件 → _publish → 推给所有订阅者
+   │
+   └─⑤ 逐帧 yield → 末帧是完整 Task（含终态与产物）
+```
+
+**设计要点**：
+
+- 载荷是标准 A2A `StreamResponse`（`statusUpdate` / `task`），过程事件的语义
+  放 `metadata.kind` —— **不认识我们的客户端也能当进度消息正常显示**
+- 订阅队列**有界**，满了丢最老的并计数。慢客户端只影响自己，
+  **绝不拖住正在跑的任务**（理由见 [ADR-007](adr/007-streaming-bounded-queue.md)）
+- 总线是**进程内**的，不持久化。持久化由 `store` 负责，总线只服务
+  「同一时刻正在看的人」—— 重启丢订阅是对的，不该假装能恢复
+- 心跳走 SSE 注释行（`: keep-alive`），不污染数据
+- `on_event` 是**后加的可选参数**。老签名的适配器由 `_accepts_on_event`
+  探测并跳过 —— 它们照常工作，只是推不了实时事件
 
 ## 适配器契约
 

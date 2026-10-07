@@ -46,6 +46,7 @@ UNIT = [
     ("test_p2_fixes", "批次 2 修复（内存 Store）"),
     ("test_adapter_p2", "适配器修复（自建假下游）"),
     ("test_isolation", "隔离（假适配器，不执行 CLI）"),
+    ("test_streaming", "流式 SSE：边跑边到 / 时间戳=发生时刻 / 背压（假适配器）"),
 ]
 
 # 平台级：会**真的起进程**（用 sys.executable，不依赖任何外部 CLI），

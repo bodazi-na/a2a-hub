@@ -681,8 +681,13 @@ class Store:
         实测 50 个事件 = 262ms 的事件循环**硬阻塞**，这期间连 `CancelTask`
         都调度不了。合成一个事务后 fsync 只发生一次。
 
-        `items` 每项支持 `role` / `kind` / `content` / `metadata` / `message_id`。
-        序号在同一事务内连续分配，顺序与传入顺序一致。
+        `items` 每项支持 `role` / `kind` / `content` / `metadata` / `message_id`
+        / **`created_at`**。序号在同一事务内连续分配，顺序与传入顺序一致。
+
+        为什么要支持逐条 `created_at`：过程事件的时间戳应当是**事件发生时刻**，
+        不是**落库时刻**。原来统一用 `now`，导致同一批事件的时间戳全挤在几毫秒内
+        —— 实测 qoder 真跑了 181 秒，全部过程事件却落在 64 毫秒之内，
+        审计时间线**顺序还在、时序全丢**（N5）。不传则仍用当前时刻。
         """
         if not items:
             return []
@@ -698,6 +703,7 @@ class Store:
             for item in items:
                 seq += 1
                 mid = item.get("message_id") or new_id()
+                created_at = item.get("created_at") or now
                 self._conn.execute(
                     """
                     INSERT INTO messages(id, task_id, seq, role, kind, content, metadata, created_at)
@@ -705,7 +711,7 @@ class Store:
                     """,
                     (mid, task_id, seq, item.get("role") or "agent",
                      item.get("kind") or "text", _dumps(item.get("content")),
-                     _dumps(item.get("metadata")), now),
+                     _dumps(item.get("metadata")), created_at),
                 )
                 out.append({
                     "id": mid,
@@ -715,7 +721,7 @@ class Store:
                     "kind": item.get("kind"),
                     "content": item.get("content"),
                     "metadata": item.get("metadata") or {},
-                    "created_at": now,
+                    "created_at": created_at,
                 })
 
         self._write_txn(work)

@@ -102,6 +102,31 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
   .kind.error { color: var(--bad); }
   .kind.status { color: var(--fg3); }
   .err { color: var(--bad); }
+
+  /* ---- 实时视图 ---- */
+  .liverow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .liverow select, .liverow input {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 5px; padding: 6px 9px; font: inherit;
+  }
+  .liverow input { flex: 1; min-width: 240px; }
+  .feed { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  #live-feed { max-height: 62vh; overflow-y: auto; }
+  .feed .row {
+    display: grid; grid-template-columns: 78px 84px 1fr;
+    gap: 10px; padding: 5px 10px; border-top: 1px solid var(--line);
+    font-size: 12px; align-items: baseline;
+  }
+  .feed .row:first-child { border-top: 0; }
+  .feed .row.terminal { background: rgba(63,185,80,.08); }
+  .feed .row.terminal.bad { background: rgba(248,81,73,.08); }
+  .feed .t { color: var(--fg3); font-variant-numeric: tabular-nums; }
+  .feed .gap { color: var(--warn); font-style: italic; }
+  .live-dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ok); margin-right: 6px; animation: pulse 1.4s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
 </style>
 </head>
 <body>
@@ -114,13 +139,25 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
 </header>
 
 <nav>
-  <button data-view="overview" class="active">概览</button>
+  <button data-view="live" class="active">实时</button>
+  <button data-view="overview">概览</button>
   <button data-view="agents">注册表</button>
   <button data-view="traces">Trace</button>
 </nav>
 
 <main>
-  <section id="view-overview" class="on">
+  <section id="view-live" class="on">
+    <div class="liverow">
+      <select id="live-agent"></select>
+      <input id="live-prompt" placeholder="给这个 agent 派个任务，边跑边看…">
+      <button id="live-start">派任务</button>
+      <button id="live-stop" disabled>断开</button>
+    </div>
+    <div class="dim" id="live-status" style="margin:8px 0 12px"></div>
+    <div id="live-feed" class="feed"><div class="empty">还没有运行中的任务。</div></div>
+  </section>
+
+  <section id="view-overview">
     <h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:0 0 10px">最近的 Trace</h2>
     <div id="ov-traces"></div>
     <h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:22px 0 10px">最近的任务</h2>
@@ -264,6 +301,11 @@ function renderTraceDetail() {
 
   $("#trace-detail").innerHTML = head
     + `<div class="gantt">${gantt}</div>`
+    + `<h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:18px 0 6px">过程时间线</h2>`
+    + `<div class="dim" style="margin-bottom:6px;font-size:12px">`
+    + `时间戳为<b>事件发生时刻</b>。想看还没跑完的任务，去「实时」页 —— `
+    + `那里是边跑边推的。注：HTTP 类下游的时间戳取自轮询时刻（下游没在 history 里带自己的时间），`
+    + `精度受轮询间隔限制。</div>`
     + `<table class="tl"><thead><tr><th>时间</th><th>agent</th><th>kind</th><th>内容</th></tr></thead><tbody>${timeline}</tbody></table>`;
 }
 
@@ -288,8 +330,121 @@ async function loadAll() {
     getJSON("/admin/tasks?limit=30").catch(() => null),
   ]);
   state.health = h; state.agents = a; state.traces = tr; state.tasks = tk;
-  renderStats(); renderAgents(); renderTraces(); renderTasks();
+  renderStats(); renderAgents(); renderTraces(); renderTasks(); renderLiveAgents();
 }
+
+// ---- 实时视图 --------------------------------------------------------------
+// 用 fetch + ReadableStream 读 SSE，而**不是** EventSource：
+// EventSource 只能发 GET，带不了 message 体。原生 API，依旧零依赖。
+let liveAbort = null;
+
+function renderLiveAgents() {
+  const sel = $("#live-agent");
+  const cur = sel.value;
+  sel.innerHTML = (state.agents || [])
+    .map(a => `<option value="${esc(a.name)}">${esc(a.name)} · ${esc(a.kind)}</option>`)
+    .join("");
+  if (cur) sel.value = cur;
+}
+
+function liveRow(t, agent, kind, text, cls) {
+  return `<div class="row ${cls || ""}">
+    <span class="t">${esc(t)}</span>
+    <span class="dim">${esc(agent || "-")}</span>
+    <span><span class="kind ${esc(kind || "")}">${esc(kind || "-")}</span> ${esc(text || "")}</span>
+  </div>`;
+}
+
+function handleFrame(frame, t0, agent) {
+  const line = frame.split("\n").find(l => l.startsWith("data:"));
+  if (!line) return;                        // 心跳（": keep-alive"）直接忽略
+  let p; try { p = JSON.parse(line.slice(5).trim()); } catch (e) { return; }
+  const r = p.result || {};
+  const t = ((performance.now() - t0) / 1000).toFixed(2) + "s";
+  const feed = $("#live-feed");
+  const empty = feed.querySelector(".empty");
+  if (empty) empty.remove();
+
+  if (r.statusUpdate) {
+    const su = r.statusUpdate, md = su.metadata || {}, st = su.status || {};
+    let text = "";
+    for (const part of ((st.message || {}).parts || [])) text += part.text || "";
+    // 服务器在跟不上时会丢事件并带上累计 dropped —— 如实标出断点，
+    // 不假装自己看到的是完整过程。
+    if (md.dropped) {
+      feed.insertAdjacentHTML("beforeend",
+        `<div class="row"><span class="t">${esc(t)}</span><span></span>
+         <span class="gap">…中间丢了 ${md.dropped} 条事件（客户端读得太慢）</span></div>`);
+    }
+    feed.insertAdjacentHTML("beforeend", liveRow(t, agent, md.kind, short(text, 220)));
+  } else if (r.task) {
+    const st = (r.task.status || {}).state || "";
+    const bad = st !== "TASK_STATE_COMPLETED";
+    feed.insertAdjacentHTML("beforeend",
+      liveRow(t, agent, "终态", st, "terminal" + (bad ? " bad" : "")));
+  }
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function startLive() {
+  const prompt = $("#live-prompt").value.trim();
+  const agent = $("#live-agent").value;
+  if (!prompt) { $("#live-status").textContent = "先写点什么再派。"; return; }
+  stopLive();
+  const ctrl = new AbortController();
+  liveAbort = ctrl;
+  $("#live-feed").innerHTML = "";
+  $("#live-start").disabled = true;
+  $("#live-stop").disabled = false;
+  $("#live-status").innerHTML =
+    `<span class="live-dot"></span>运行中 · agent=${esc(agent)} · 事件在发生的那一刻就推过来`;
+
+  const t0 = performance.now();
+  fetch("/", {
+    method: "POST",
+    signal: ctrl.signal,
+    headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: "live", method: "SendStreamingMessage",
+      params: { agent, message: { messageId: "m" + Date.now(), role: "ROLE_USER",
+                                  parts: [{ text: prompt }] } },
+    }),
+  }).then(async (resp) => {
+    if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      // SSE 以空行分帧。必须自己按 "\n\n" 切 —— 一个 chunk 里可能有多帧，
+      // 也可能只有半帧，直接 JSON.parse 整块会漏事件。
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        handleFrame(buf.slice(0, i), t0, agent);
+        buf = buf.slice(i + 2);
+      }
+    }
+    $("#live-status").textContent = "流已结束。";
+  }).catch((e) => {
+    if (e.name !== "AbortError") $("#live-status").textContent = "出错：" + e.message;
+  }).finally(() => {
+    liveAbort = null;
+    $("#live-start").disabled = false;
+    $("#live-stop").disabled = true;
+  });
+}
+
+function stopLive() {
+  if (liveAbort) { liveAbort.abort(); liveAbort = null; }
+  $("#live-start").disabled = false;
+  $("#live-stop").disabled = true;
+}
+
+$("#live-start").onclick = startLive;
+$("#live-stop").onclick = () => { stopLive(); $("#live-status").textContent = "已断开。"; };
+$("#live-prompt").onkeydown = (e) => { if (e.key === "Enter") startLive(); };
 
 function switchView(v) {
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.view === v));

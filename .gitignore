@@ -40,3 +40,5 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+# Windows 快捷方式：指向的是本机绝对路径，换台机器就是死链，不该进仓库
+*.lnk

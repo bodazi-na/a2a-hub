@@ -30,7 +30,7 @@ from pathlib import Path
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
-from a2a_hub.cli import _is_loopback  # noqa: E402
+from a2a_hub.cli import _is_loopback, _normalize_host  # noqa: E402
 
 PY = sys.executable
 PORT = 9276
@@ -76,17 +76,29 @@ def serve(host: str, extra: list[str] | None = None,
 # ------------------------------------------------------------------ 用例
 
 def test_loopback_classification() -> list:
-    """哪些地址算「只有本机能访问」。主机名一律按非回环 —— 往安全方向错。"""
+    """哪些地址算「只有本机能访问」。
+
+    原则是**宁可误拒，不放行** —— 解析不了的一律按非回环。但「确实是本机的
+    写法」不该误拒：`[::1]` 是 IPv6 在 URL 里的标准写法，`LOCALHOST` 只是大小写
+    差异，两者都该放行（放行它们不削弱安全性，因为它们本来就是本机）。
+    """
     print("\n[分类] 回环 / 非回环 判定")
     out = []
     for host, want in [
-        ("127.0.0.1", True), ("::1", True), ("localhost", True),
-        ("127.1.2.3", True),        # 整个 127/8 都是回环，不只是 127.0.0.1
-        ("0.0.0.0", False),         # 所有网卡 —— 最典型的「裸露」
-        ("::", False),              # IPv6 的「所有网卡」
+        # —— 确实是本机：必须放行
+        ("127.0.0.1", True),
+        ("127.1.2.3", True),            # 整个 127/8 都是回环，不只是 127.0.0.1
+        ("::1", True),
+        ("[::1]", True),                # URL 形式的 IPv6（从地址栏复制过来就带括号）
+        ("localhost", True),
+        ("LOCALHOST", True),            # 主机名大小写不敏感
+        (" 127.0.0.1 ", True),          # 首尾空白
+        # —— 会暴露到网络：必须拦住
+        ("0.0.0.0", False),             # 所有网卡 —— 最典型的「裸露」
+        ("::", False),                  # IPv6 的「所有网卡」
         ("192.168.1.5", False),
         ("10.0.0.1", False),
-        ("example.com", False),     # 主机名解析成什么不猜，一律按非回环
+        ("example.com", False),         # 主机名一律不解析，按非回环
     ]:
         out.append(check(f"{host!r} → {'回环' if want else '非回环'}",
                          _is_loopback(host) is want))
@@ -197,8 +209,42 @@ def test_auth_actually_blocks() -> list:
     return out
 
 
+def test_host_normalization() -> list:
+    """归一化：判定与绑定必须用同一个值。
+
+    `[::1]` 是 IPv6 在 URL 里的标准写法（从地址栏复制就带括号）。
+    它判定上是回环、该放行，但 **uvicorn 拿 `[::1]` 当主机名解析会失败** ——
+    只在判定处剥括号的话，护栏放行了、服务却起不来。
+    """
+    print("\n[归一化] 剥方括号 / 去空白")
+    out = [
+        check("[::1] → ::1", _normalize_host("[::1]") == "::1"),
+        check("[::ffff:127.0.0.1] → ::ffff:127.0.0.1",
+              _normalize_host("[::ffff:127.0.0.1]") == "::ffff:127.0.0.1"),
+        check(" 127.0.0.1  → 去空白", _normalize_host(" 127.0.0.1 ") == "127.0.0.1"),
+        check("0.0.0.0 不受影响", _normalize_host("0.0.0.0") == "0.0.0.0"),
+        check("孤立的 [ 不误剥", _normalize_host("[::1") == "[::1"),
+    ]
+    return out
+
+
+def test_loopback_spellings_actually_start() -> list:
+    """本机地址的各种写法都要能**真的起起来**（不是只判定通过）。
+
+    「进程 4 秒后仍活着」就说明绑定成功了 —— 绑不上 uvicorn 会直接退出。
+    """
+    print("\n[端到端] 本机地址的合法写法能真的绑定")
+    out = []
+    for host in ("127.0.0.1", "localhost", "LOCALHOST", "[::1]", "::1"):
+        _c, _o, alive = serve(host, wait=4.0)
+        out.append(check(f"--host {host} → 起得来", alive))
+    return out
+
+
 CASES = [
     ("回环判定", test_loopback_classification),
+    ("归一化", test_host_normalization),
+    ("本机写法能起", test_loopback_spellings_actually_start),
     ("裸奔被拒", test_naked_start_refused),
     ("空 token 不算认证", test_empty_token_is_not_auth),
     ("认证与豁免放行", test_auth_and_override_pass),

@@ -113,12 +113,45 @@ def build_hub(db_path: Path, *, auth_token: str | None = None) -> Hub:
     return hub
 
 
+def _normalize_host(host: str) -> str:
+    """把用户写法归一成**能直接交给 uvicorn** 的形式。
+
+    目前只做两件事：去首尾空白、剥掉 IPv6 的方括号。
+
+    方括号这条不是洁癖：`[::1]` 是 IPv6 在 URL 里的标准写法，用户从地址栏
+    复制过来就是带括号的。它**判定上**是回环地址（护栏该放行），但**绑定时**
+    `uvicorn` 拿 `[::1]` 当主机名去解析会失败。所以归一化必须同时用在
+    「判定」和「实际绑定」两处 —— 只在判定处剥括号的话，护栏放行了、
+    服务却起不来，用户看到的是一句莫名其妙的绑定错误。
+    """
+    h = host.strip()
+    if len(h) >= 2 and h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    return h
+
+
 def _is_loopback(host: str) -> bool:
-    """判断绑定地址是否只有本机能访问。主机名等一律按「非回环」处理——往安全方向错。"""
-    if host in ("localhost", "::1"):
+    """判断绑定地址是否只有本机能访问。
+
+    **方向是「宁可误拒，不放行」**：解析不了的一律按非回环处理。所以这里做的
+    每一项归一化都必须**只放宽确实是本机地址的写法**，不能顺手把范围放大。
+
+    归一化两类写法（它们都是本机，但 `ip_address()` 直接解析会失败）：
+
+      - `[::1]` —— IPv6 在 URL 里的标准写法，用户从地址栏复制过来就是带括号的
+      - `LOCALHOST` / `LocalHost` —— 主机名大小写不敏感
+
+    不做的归一化：**主机名一律不解析**。`my-pc` 可能指向 127.0.0.1、也可能指向
+    局域网地址，而解析结果取决于本机 hosts / DNS，护栏不该建立在那上面。
+
+    （IPv4-mapped IPv6 不用特殊处理：`ip_address('::ffff:127.0.0.1').is_loopback`
+    本来就是 True —— 实测确认过。）
+    """
+    h = _normalize_host(host)
+    if h.lower() == "localhost":
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
 
@@ -128,12 +161,16 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     token = args.token or os.environ.get("HUB_TOKEN") or None
 
+    # 归一化只做一次，**判定与绑定用同一个值**。见 _normalize_host 的说明：
+    # 只在判定处剥方括号的话，`--host [::1]` 护栏放行了、uvicorn 却绑不上。
+    host = _normalize_host(args.host)
+
     # H1 护栏：hub 的能力 = 驱动 CLI agent 在本机干活，暴露到非回环网络
     # 又不配认证，等于把任意代码执行开放给同网段。宁可拒绝启动也不静默裸奔。
-    if not _is_loopback(args.host) and not token and not args.allow_insecure:
+    if not _is_loopback(host) and not token and not args.allow_insecure:
         print(
             "[hub] 拒绝启动：绑定到非回环地址（"
-            f"{args.host}）但未启用认证。\n"
+            f"{host}）但未启用认证。\n"
             "      hub 能驱动本机 CLI agent 执行任务——裸奔到网络上等于开放远程代码执行。\n"
             "      三选一：① --token <值> 或环境变量 HUB_TOKEN 启用 Bearer 认证；\n"
             "              ② 改回 --host 127.0.0.1 仅本机使用；\n"
@@ -143,15 +180,18 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     hub = build_hub(Path(args.db), auth_token=token)
     names = [a.name for a in hub.registry.list(enabled_only=False)]
+    # URL 里的 IPv6 要带方括号（`http://::1:9200` 是无效写法），
+    # 而绑定时**不能**带 —— 所以展示用带括号的，绑定用归一化后的。
+    shown = f"[{host}]" if ":" in host else host
     print(f"[hub] db      = {args.db}")
     print(f"[hub] agents  = {names or '(空)'}")
     print(f"[hub] auth    = {'Bearer 已启用' if token else '关闭（仅本机使用）'}")
-    if not _is_loopback(args.host) and not token:
-        print(f"[hub] !! 警告：服务暴露在 {args.host} 上且未启用认证（--allow-insecure 豁免）——"
+    if not _is_loopback(host) and not token:
+        print(f"[hub] !! 警告：服务暴露在 {host} 上且未启用认证（--allow-insecure 豁免）——"
               "同网段任何人都能派发任务")
-    print(f"[hub] card    = http://{args.host}:{args.port}/.well-known/agent-card.json")
-    print(f"[hub] console = http://{args.host}:{args.port}/console")
-    uvicorn.run(hub.build_app(), host=args.host, port=args.port, log_level="info")
+    print(f"[hub] card    = http://{shown}:{args.port}/.well-known/agent-card.json")
+    print(f"[hub] console = http://{shown}:{args.port}/console")
+    uvicorn.run(hub.build_app(), host=host, port=args.port, log_level="info")
 
 
 def cmd_register(args: argparse.Namespace) -> None:

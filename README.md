@@ -4,6 +4,8 @@
 
 它解决的是「一堆 A2A agent 各自为政」的问题——没有注册中心、没有路由、任务状态重启即失。hub 把这三件事补上，并且**自己也是一个标准的 A2A agent**，任何会说 A2A 的客户端都能调它。
 
+**中文** · [English](README.en.md)
+
 ---
 
 > ## 🤖 AI 创作声明
@@ -104,7 +106,7 @@ curl -X POST http://127.0.0.1:9200/ -H "Content-Type: application/json" \
 - 用现成的 CLI（claude / codex / dsh / qoder）：见 [适配器](#适配器两类下游) 与
   [注册一个 CLI agent](#注册一个-cli-agent)；`examples/agents/` 下有四个真实配置样例
 - 下游已经是一个 A2A 服务：直接 `hub.py register --endpoint <url>` 即可
-- 都不是：照着 [写 CLI 适配器必踩的三个坑](#写-cli-适配器必踩的三个坑都实测过)
+- 都不是：照着 [`docs/architecture.md` 的「写 CLI 适配器必踩的坑」](docs/architecture.md#写-cli-适配器必踩的坑全部实测过)
   和 `examples/mock_agent.py` 自己写一层
 
 ## 任务模型

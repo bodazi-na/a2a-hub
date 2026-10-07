@@ -31,6 +31,9 @@
 - **`start-hub.bat` 启动器**：双击 exe 是起不来的（不带子命令只打一行用法错误、
   退出码 2），构建时会在 exe 旁边放一个启动器 —— 双击它 = 起服务 + 等就绪 +
   自动开浏览器，服务跑在自己的窗口里，日志可见、Ctrl-C 能停。
+  **它会自己找 exe**（脚本旁 → `dist\a2a-hub\` → 上一级的 `dist\`），
+  所以源码仓库里的 `packaging\start-hub.bat` 也能直接用；找不到时逐条列出
+  查过的路径并给出修法。定位后 `cd` 到 exe 所在目录再启动（`data\` 跟着 exe 走）。
   另加 `.gitattributes` 声明 `*.bat text eol=crlf`（cmd 需要 CRLF）
 
   这个 `.bat` **刻意写成纯 ASCII**：cmd.exe 按**系统代码页**（中文 Windows 是

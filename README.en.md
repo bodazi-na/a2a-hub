@@ -598,6 +598,20 @@ start-hub.bat          :: default port 9200
 start-hub.bat 9300     :: use another port
 ```
 
+**It finds the exe itself.** It checks these in order and uses the first hit:
+
+1. Next to the script (the normal case — that is how the build lays it out)
+2. `dist\a2a-hub\a2a-hub.exe` next to the script
+3. `dist\a2a-hub\a2a-hub.exe` and `dist\a2a-hub.exe` one level up
+
+So **`packaging\start-hub.bat` works from a source checkout too** (it finds the
+build output under `..\dist\`). When nothing is found it **lists every path it
+tried** and gives two concrete fixes, instead of just saying "not found".
+
+Once located, it `cd`s to the exe's folder before launching — because `data\` and
+`workspace\` follow the exe, which is what makes "copy the whole folder anywhere"
+actually hold.
+
 > **This .bat is deliberately ASCII-only.** cmd.exe parses .bat files using the
 > **system code page** (GBK/cp936 on Chinese Windows), so a UTF-8 batch file with
 > non-ASCII text turns into mojibake — and worse, a truncated multi-byte sequence can

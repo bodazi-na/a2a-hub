@@ -25,18 +25,50 @@ cd /d "%~dp0"
 set "PORT=%~1"
 if "%PORT%"=="" set "PORT=9200"
 
-if not exist "a2a-hub.exe" (
+REM ---------------------------------------------------------------------------
+REM  Locate a2a-hub.exe.
+REM
+REM  This same script ships in two places: next to the exe (what users get from
+REM  the build) and in packaging/ (the source template). Only the first has an
+REM  exe beside it -- so double-clicking the one in packaging/ used to fail with
+REM  "not found", which is a confusing dead end.
+REM
+REM  So: look next to the script first, then in the two obvious build-output
+REM  locations relative to it. That makes the launcher work from a source
+REM  checkout too.
+REM ---------------------------------------------------------------------------
+set "HUB_EXE="
+if exist "a2a-hub.exe"                    set "HUB_EXE=%CD%\a2a-hub.exe"
+if not defined HUB_EXE if exist "dist\a2a-hub\a2a-hub.exe"        set "HUB_EXE=%CD%\dist\a2a-hub\a2a-hub.exe"
+if not defined HUB_EXE if exist "dist\a2a-hub.exe"                set "HUB_EXE=%CD%\dist\a2a-hub.exe"
+if not defined HUB_EXE if exist "%~dp0..\dist\a2a-hub\a2a-hub.exe" set "HUB_EXE=%~dp0..\dist\a2a-hub\a2a-hub.exe"
+if not defined HUB_EXE if exist "%~dp0..\dist\a2a-hub.exe"         set "HUB_EXE=%~dp0..\dist\a2a-hub.exe"
+
+if not defined HUB_EXE (
   echo.
-  echo   [ERROR] a2a-hub.exe was not found next to this script.
-  echo           Keep start-hub.bat in the same folder as a2a-hub.exe.
+  echo   [ERROR] a2a-hub.exe was not found.
+  echo.
+  echo   Looked in:
+  echo     %CD%\a2a-hub.exe
+  echo     %CD%\dist\a2a-hub\a2a-hub.exe
+  echo     %~dp0..\dist\a2a-hub\a2a-hub.exe
+  echo.
+  echo   Fix it by either:
+  echo     1^) building it:   python tools\build_exe.py
+  echo     2^) or putting start-hub.bat in the same folder as a2a-hub.exe
   echo.
   pause
   exit /b 1
 )
 
+REM Run from the exe's own folder: that is where the hub keeps data\ and
+REM workspace\, and it is what makes "copy the folder anywhere" work.
+for %%I in ("%HUB_EXE%") do cd /d "%%~dpI"
+
 echo.
 echo   a2a-hub
 echo   ------------------------------------------------------------------
+echo   exe     : %HUB_EXE%
 echo   console : http://127.0.0.1:%PORT%/console
 echo   stop    : press Ctrl-C, or just close this window
 echo   ------------------------------------------------------------------
@@ -48,7 +80,7 @@ REM a connection error and the user has to refresh manually.
 start "" /min cmd /c "timeout /t 3 /nobreak >nul & start http://127.0.0.1:%PORT%/console"
 
 REM Run the hub in THIS window, so its log stays visible and Ctrl-C stops it.
-a2a-hub.exe serve --host 127.0.0.1 --port %PORT%
+"%HUB_EXE%" serve --host 127.0.0.1 --port %PORT%
 
 echo.
 echo   hub stopped.

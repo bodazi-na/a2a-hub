@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""`python -m mcp_facade` 入口。"""
+"""`python -m a2a_hub.mcp_facade` 入口。"""
 
 from .server import main
 

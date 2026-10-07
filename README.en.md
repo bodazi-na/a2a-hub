@@ -743,18 +743,23 @@ machine, see [`docs/architecture.md`](docs/architecture.md).
 
 ```
 a2a-hub/
-├── core/                  platform-agnostic, open-sourceable
-│   ├── store.py           SQLite six tables + schema migration + transaction boundaries + queries
-│   ├── registry.py        Agent registry + health probing
-│   ├── router.py          Capability-matching routing
-│   ├── orchestrator.py    Orchestration engine (topological layering + same-layer parallelism + templates)
-│   ├── hub_app.py         The A2A server (incl. RunPlan / GetPlan extensions + admin endpoints)
-│   └── console.py         Read-only console (single-page HTML, zero front-end deps)
-├── adapters/              one layer per downstream, pluggable
-│   ├── base.py            Adapter contract + downstream normalisation
-│   ├── a2a_http.py        Generic HTTP A2A adapter (raw JSON-RPC, zero SDK dependency)
-│   └── cli.py             CLI adapters (claude / qodercli / codex / dsh)
-├── mcp_facade/            **optional component**: wraps hub as an MCP server
+├── src/a2a_hub/           **the single top-level package** — the only name installed
+│   ├── cli.py             Command-line entry (`a2a-hub` / `python -m a2a_hub`)
+│   ├── core/              platform-agnostic, open-sourceable
+│   │   ├── store.py       SQLite six tables + schema migration + transaction boundaries + queries
+│   │   ├── registry.py    Agent registry + health probing
+│   │   ├── router.py      Capability-matching routing
+│   │   ├── orchestrator.py Orchestration engine (topological layering + same-layer parallelism + templates)
+│   │   ├── parallelism.py Parallelism analysis (layer inference / utilisation / overhead)
+│   │   ├── hub_app.py     The A2A server (incl. RunPlan / GetPlan extensions + admin endpoints)
+│   │   └── console.py     Read-only console (single-page HTML, zero front-end deps)
+│   ├── adapters/          one layer per downstream, pluggable
+│   │   ├── base.py        Adapter contract + downstream normalisation
+│   │   ├── a2a_http.py    Generic HTTP A2A adapter (raw JSON-RPC, zero SDK dependency)
+│   │   └── cli.py         CLI adapters (claude / qodercli / codex / dsh)
+│   ├── probes/            Local AI tool process probing (the adapter `detect` implementation)
+│   └── mcp_facade/        **optional component**: wraps hub as an MCP server
+├── hub.py                 **source-checkout dev entry**, not installed (see below)
 ├── examples/
 │   ├── mock_agent.py      Zero-dependency demo downstream (what Quick start uses)
 │   ├── agents/            Registration samples for four real CLIs
@@ -765,16 +770,38 @@ a2a-hub/
 │   └── adr/               Architecture decision records (why it is this way)
 ├── tools/
 │   └── run_plan.py        Long-orchestration submitter (configurable timeout, results to disk)
-├── probes/
-│   └── process_monitor.py Local AI tool process probing (the adapter `detect` implementation)
 ├── tests/                 Three-tier self-check: unit / platform / integration
-├── hub.py                 Command-line entry point
 ├── agents/                Local agent registration configs (**runtime**, not in the repo)
 └── data/hub.db            SQLite (**runtime**, not in the repo)
 ```
 
 **A new execution backend = a new `Adapter` subclass, with zero changes to core.**
 That is what "thick adapters" means.
+
+### Why the `src/` layout, and what that `hub.py` is
+
+**Only one name at the top level.** Previously `hub` / `core` / `adapters` / `probes` /
+`mcp_facade` were five **top-level** modules, so installing it put all five into the top
+level of site-packages — and a generic name like `core` is almost guaranteed to collide.
+The "solution" back then was to tell users to install into a dedicated virtualenv, which
+is **passing a design flaw on to the user**. They now all live under `a2a_hub`:
+
+```python
+from a2a_hub.core.store import Store     # was: from core.store import Store
+from a2a_hub.adapters.cli import DshCLI
+```
+
+The `src/` layout has an extra benefit: **you cannot accidentally import a same-named
+file from the working directory**, so tests verify the code that actually ships.
+
+The `hub.py` at the repo root is a **dev entry** that keeps the `python hub.py serve`
+used throughout the docs working. It is **not part of the installed package**, so it
+does not pollute the namespace. Once installed, prefer:
+
+```bash
+a2a-hub serve                    # console script
+python -m a2a_hub serve          # equivalent, independent of your cwd
+```
 
 ## Two pitfalls you must know
 
@@ -919,9 +946,4 @@ Listed honestly, so you do not have to discover them the hard way:
 - **`hub → WorkBuddy` is not connected**, and that is a design boundary rather than a
   defect: that platform only exposes a tool set, with no task-level entry point. The
   reverse direction (WorkBuddy → hub) works.
-- **It is a service, not a library you import.** The distribution name is `a2a-hub`
-  while the importable top-level modules are `hub` / `core` / `adapters` / `probes` /
-  `mcp_facade`. Generic names like `core` and `adapters` occupy the top level of
-  site-packages — if you want to use it as a library, install it into a dedicated
-  virtual environment (which is what the Quick start does).
 - **Not done yet**: CI runs only the unit + platform tiers; no PyPI release; no Docker.

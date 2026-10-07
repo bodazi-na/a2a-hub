@@ -179,15 +179,17 @@ CLI 类少一层桥、少一个常驻进程，代价是自己管子进程生命�
 
 ```
 a2a-hub/                     ← 代码层（进仓库）
-├── core/                    store · registry · router · orchestrator · hub_app · console
-├── adapters/                base · a2a_http · cli
-├── mcp_facade/              可选：把 hub 包成 MCP server
-├── probes/                  process_monitor（本机进程探测）
+├── src/a2a_hub/             **唯一的顶层包**（装进环境后只占这一个名字）
+│   ├── cli.py               命令行入口（a2a-hub / python -m a2a_hub）
+│   ├── core/                store · registry · router · orchestrator · parallelism · hub_app · console
+│   ├── adapters/            base · a2a_http · cli
+│   ├── probes/              process_monitor（本机进程探测）
+│   └── mcp_facade/          可选：把 hub 包成 MCP server
 ├── examples/                演示下游 + 配置样例
 ├── docs/                    架构与 ADR
 ├── tools/                   run_plan.py（长编排提交器）
 ├── tests/                   三档自检
-├── hub.py                   命令行入口
+├── hub.py                   源码仓库的开发入口（**不随包安装**，见下）
 └── pyproject.toml / README.md / LICENSE
 
 以下由 .gitignore 排除（运行时层，**注意必须锚定到仓库根**）：

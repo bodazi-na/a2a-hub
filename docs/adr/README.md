@@ -13,6 +13,7 @@
 | [005](005-no-to-thread-for-store.md) | **不**把 Store 改造成 `asyncio.to_thread` | 实测根因是一次 fsync，改 PRAGMA 就拿到 64 倍 —— 重构不划算且新增竞态面 |
 | [006](006-explicit-transactions.md) | 多语句读写显式包事务；事务不可重入 | 读用快照事务、写用 `_write_txn`、改 metadata 用原子合并 |
 | [007](007-streaming-bounded-queue.md) | 实时流用**有界队列 + 丢最老**做背压 | 慢客户端只影响自己，绝不拖住正在跑的任务；丢了多少随流送出 |
+| [008](008-src-layout-single-top-level-package.md) | src 布局 + 单一顶层包 `a2a_hub` | 「建议装独立 venv」是**把设计缺陷转嫁成用户的负担** —— 能被修掉的问题不该写成使用注意事项 |
 
 ## 怎么写一条新 ADR
 

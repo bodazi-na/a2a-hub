@@ -31,6 +31,14 @@ import os
 import subprocess
 import sys
 
+# CI 的 windows-latest 默认代码页是 cp1252，编不下测试标题里的中文，
+# print 直接 UnicodeEncodeError —— 两个 Windows 任务因此全挂（ubuntu 不受影响）。
+# 统一把输出流切到 utf-8（py3.7+ 都支持 reconfigure），本机与 CI 行为一致。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 
@@ -74,9 +82,14 @@ def run_one(name: str) -> tuple[bool, str]:
     path = os.path.join(ROOT, "tests", f"{name}.py")
     if not os.path.exists(path):
         return False, "脚本不存在"
+    # 子进程会打印中文标题：CI runner（cp1252）下若继承到非 UTF-8 的
+    # PYTHONIOENCODING 会直接 UnicodeEncodeError。这里强制切成 utf-8。
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     proc = subprocess.run(
         [PY, path], cwd=ROOT, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=600,
+        encoding="utf-8", errors="replace", timeout=600, env=env,
     )
     tail = (proc.stdout or "").strip().splitlines()
     summary = next((l for l in reversed(tail) if "RESULT" in l or "汇总" in l), "")

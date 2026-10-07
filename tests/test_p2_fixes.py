@@ -15,15 +15,18 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
+# 不是仓库根 —— 仓库根下已经没有可导入的包了。
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
 
-from adapters.base import Adapter, CallResult          # noqa: E402
-from adapters.cli import CLIAdapter                    # noqa: E402
-from core.hub_app import Hub, clamp_limit, parse_timeout  # noqa: E402
-from core.orchestrator import PlanError, topo_layers, Step, infer_dependencies  # noqa: E402
-from core.registry import AgentRecord, Registry        # noqa: E402
-from core.router import NoRouteError, Router           # noqa: E402
-from core.store import Store                           # noqa: E402
+from a2a_hub.adapters.base import Adapter, CallResult          # noqa: E402
+from a2a_hub.adapters.cli import CLIAdapter                    # noqa: E402
+from a2a_hub.core.hub_app import Hub, clamp_limit, parse_timeout  # noqa: E402
+from a2a_hub.core.orchestrator import PlanError, topo_layers, Step, infer_dependencies  # noqa: E402
+from a2a_hub.core.registry import AgentRecord, Registry        # noqa: E402
+from a2a_hub.core.router import NoRouteError, Router           # noqa: E402
+from a2a_hub.core.store import Store                           # noqa: E402
 
 
 class EchoAdapter(Adapter):

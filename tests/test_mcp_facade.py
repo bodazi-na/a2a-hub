@@ -14,19 +14,26 @@ import asyncio
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
+# 不是仓库根 —— 仓库根下已经没有可导入的包了。
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client           # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
+SRC = os.path.join(ROOT, "src")
 
+# 子进程用 `-m a2a_hub.mcp_facade`：包在 src 布局下，所以 PYTHONPATH 要给
+# **<仓库根>/src**（不是仓库根）。给错了子进程会直接起不来，客户端只看到
+# 一句 "Connection closed" —— 看不出跟路径有关。
 PARAMS = StdioServerParameters(
     command=PY,
-    args=["-m", "mcp_facade"],
+    args=["-m", "a2a_hub.mcp_facade"],
     cwd=ROOT,
-    env={**os.environ, "PYTHONPATH": ROOT},
+    env={**os.environ, "PYTHONPATH": SRC},
 )
 
 

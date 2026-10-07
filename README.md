@@ -663,18 +663,23 @@ exe 走的，这样「整个文件夹拷到哪都能用」才成立。
 
 ```
 a2a-hub/
-├── core/                  平台无关，可开源
-│   ├── store.py           SQLite 六表 + schema 迁移 + 事务边界 + 查询接口
-│   ├── registry.py        Agent 注册表 + 健康探测
-│   ├── router.py          能力匹配路由
-│   ├── orchestrator.py    编排引擎（拓扑分层 + 同层并行 + 模板变量）
-│   ├── hub_app.py         对外 A2A 服务端（含 RunPlan / GetPlan 编排扩展 + admin 端点）
-│   └── console.py         只读控制台（单页 HTML，零前端依赖）
-├── adapters/              每个下游一层，可插拔
-│   ├── base.py            Adapter 契约 + 下游差异归一化
-│   ├── a2a_http.py        通用 HTTP A2A 适配器（裸 JSON-RPC，零 SDK 依赖）
-│   └── cli.py             CLI 适配器（claude / qodercli / codex / dsh）
-├── mcp_facade/            **可选组件**：把 hub 包成 MCP server，让支持 MCP 的平台能调它
+├── src/a2a_hub/           **唯一的顶层包** —— 装进环境后只占这一个名字
+│   ├── cli.py             命令行入口（`a2a-hub` / `python -m a2a_hub`）
+│   ├── core/              平台无关，可开源
+│   │   ├── store.py       SQLite 六表 + schema 迁移 + 事务边界 + 查询接口
+│   │   ├── registry.py    Agent 注册表 + 健康探测
+│   │   ├── router.py      能力匹配路由
+│   │   ├── orchestrator.py 编排引擎（拓扑分层 + 同层并行 + 模板变量）
+│   │   ├── parallelism.py 并行度分析（分层推断 / 利用率 / 编排开销）
+│   │   ├── hub_app.py     对外 A2A 服务端（含 RunPlan / GetPlan 编排扩展 + admin 端点）
+│   │   └── console.py     只读控制台（单页 HTML，零前端依赖）
+│   ├── adapters/          每个下游一层，可插拔
+│   │   ├── base.py        Adapter 契约 + 下游差异归一化
+│   │   ├── a2a_http.py    通用 HTTP A2A 适配器（裸 JSON-RPC，零 SDK 依赖）
+│   │   └── cli.py         CLI 适配器（claude / qodercli / codex / dsh）
+│   ├── probes/            本机 AI 工具进程探测（适配器 detect 层的实现）
+│   └── mcp_facade/        **可选组件**：把 hub 包成 MCP server
+├── hub.py                 **源码仓库的开发入口**，不随包安装（详见下）
 ├── examples/
 │   ├── mock_agent.py      零依赖演示下游（快速开始用的就是它）
 │   ├── agents/            四个真实 CLI 的注册配置样例
@@ -685,15 +690,35 @@ a2a-hub/
 │   └── adr/               架构决策记录（为什么这么选）
 ├── tools/
 │   └── run_plan.py        长编排提交器（客户端超时可配、结果落盘）
-├── probes/
-│   └── process_monitor.py 本机 AI 工具进程探测（适配器 detect 层的实现）
 ├── tests/                 三档自检：单元 / 平台 / 集成（见 CONTRIBUTING.md）
-├── hub.py                 命令行入口
 ├── agents/                本机 agent 注册配置（**运行时**，不进仓库）
 └── data/hub.db            SQLite（**运行时**生成，不进仓库）
 ```
 
 **新增一种执行体 = 新增一个 `Adapter` 子类，core 一行不改。** 这是「厚适配器」的含义。
+
+### 为什么是 `src/` 布局，以及那个 `hub.py` 是什么
+
+**顶层只占一个名字。** 以前 `hub` / `core` / `adapters` / `probes` / `mcp_facade`
+是五个**顶层**模块，装进环境后会占据 site-packages 的顶层命名空间 —— `core`
+这种名字几乎必然和别人撞车，当时的「解法」是让用户装独立虚拟环境，那是把设计
+缺陷转嫁成用户的负担。现在它们全在 `a2a_hub` 底下：
+
+```python
+from a2a_hub.core.store import Store        # 以前是 from core.store import Store
+from a2a_hub.adapters.cli import DshCLI
+```
+
+`src/` 布局的额外好处：**import 不到工作目录里的同名文件**，所以测试验证的
+一定是真正会被装出去的那份代码。
+
+仓库根那个 `hub.py` 是**开发入口**，让文档里到处存在的 `python hub.py serve`
+继续可用。它**不在安装包内**，所以不污染命名空间。装过包之后更推荐：
+
+```bash
+a2a-hub serve                    # 控制台脚本
+python -m a2a_hub serve          # 等价，不依赖你在哪个目录
+```
 
 ## 两个必须知道的坑
 
@@ -823,8 +848,4 @@ python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑�
   别指望前两个。
 - **`hub → WorkBuddy` 这条没打通**，是设计边界不是缺陷：对方只暴露工具集、
   没有任务级入口。反方向（WorkBuddy → hub）是通的。
-- **它是个服务，不是一个 import 进去用的库**。发行名叫 `a2a-hub`，可导入的顶层模块是
-  `hub` / `core` / `adapters` / `probes` / `mcp_facade`。`core` 和 `adapters`
-  这种通用名会占据 site-packages 的顶层命名空间 —— 如果你要把它当库用，
-  建议装进独立的虚拟环境（README 的快速开始就是这么做的）。
 - **尚未做**：CI 只跑单元级 + 平台级；无 PyPI 发布；无 Docker。

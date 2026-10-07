@@ -22,9 +22,12 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
+# 不是仓库根 —— 仓库根下已经没有可导入的包了。
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
 
-from adapters.base import (                                      # noqa: E402
+from a2a_hub.adapters.base import (                                      # noqa: E402
     EVENT_TEXT,
     EVENT_THINKING,
     Adapter,
@@ -34,10 +37,10 @@ from adapters.base import (                                      # noqa: E402
 )
 from starlette.responses import StreamingResponse                # noqa: E402
 
-from core.hub_app import ACTIVE_STATES, Hub, SSE_QUEUE_MAX       # noqa: E402
-from core.registry import AgentRecord, Registry                  # noqa: E402
-from core.router import Router                                   # noqa: E402
-from core.store import Store                                     # noqa: E402
+from a2a_hub.core.hub_app import ACTIVE_STATES, Hub, SSE_QUEUE_MAX       # noqa: E402
+from a2a_hub.core.registry import AgentRecord, Registry                  # noqa: E402
+from a2a_hub.core.router import Router                                   # noqa: E402
+from a2a_hub.core.store import Store                                     # noqa: E402
 
 
 class StreamingAdapter(Adapter):

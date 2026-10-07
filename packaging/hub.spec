@@ -33,8 +33,11 @@ hidden = collect_submodules("uvicorn") + [
 ]
 
 a = Analysis(
-    [os.path.join(ROOT, "hub.py")],
-    pathex=[ROOT],                    # 让 core / adapters / probes 能被解析到
+    # 入口是包里的 cli.py —— 不是仓库根那个 hub.py shim。
+    # shim 靠 `Path(__file__).parent / "src"` 找包，而**冻结后 `__file__` 指向
+    # 打包内部**，那个 src/ 并不存在；直接指向 cli.py 更干净。
+    [os.path.join(ROOT, "src", "a2a_hub", "cli.py")],
+    pathex=[os.path.join(ROOT, "src")],   # 让 a2a_hub.* 能被解析到
     binaries=[],
     datas=[],
     hiddenimports=hidden,

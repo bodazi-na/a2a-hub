@@ -11,7 +11,7 @@ Codex / Qoder / Claude Code 用 MCP。逐个写 skill 是 5 份重复内容；
 --------
 它是**可选组件**，不是 hub 的核心：
 
-- `core/` 保持纯 A2A，一行不改
+- `a2a_hub/core/` 保持纯 A2A，一行不改
 - facade 通过 **HTTP** 调 hub（不 import core），所以它和 hub 是解耦的 ——
   可以单独起、单独停、单独部署
 - 换掉它，hub 依然是完整的 A2A 服务
@@ -26,7 +26,7 @@ stdio（多数 MCP 客户端）：
 
 或作为模块：
 
-    python -m mcp_facade.server
+    python -m a2a_hub.mcp_facade.server
 
 环境变量
 --------

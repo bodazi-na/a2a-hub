@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable
 def utcnow() -> str:
     """当前 UTC 时刻（ISO8601，微秒精度）。
 
-    与 `core/store.py` 里的同名函数**故意重复**：分层方向是 core → adapters，
+    与 `a2a_hub/core/store.py` 里的同名函数**故意重复**：分层方向是 core → adapters，
     适配器不该反向 import core。这个函数只有三行，重复的代价远小于
     在适配器层引入对 core 的依赖 —— 那会让「新增一种执行体不必碰 core」
     这条设计约束失效。

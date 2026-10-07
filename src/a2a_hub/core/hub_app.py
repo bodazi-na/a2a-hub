@@ -49,12 +49,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from adapters.base import Adapter
-from core.orchestrator import Orchestrator, PlanError
-from core.parallelism import analyze
-from core.registry import Registry
-from core.router import NoRouteError, Router
-from core.store import Store, new_id
+from a2a_hub.adapters.base import Adapter
+from a2a_hub.core.orchestrator import Orchestrator, PlanError
+from a2a_hub.core.parallelism import analyze
+from a2a_hub.core.registry import Registry
+from a2a_hub.core.router import NoRouteError, Router
+from a2a_hub.core.store import Store, new_id
 
 HUB_NAME = "a2a-hub"
 HUB_VERSION = "0.2.0"
@@ -638,7 +638,7 @@ class Hub:
         """只读控制台面板（单页 HTML，零构建、零前端依赖）。"""
         from starlette.responses import HTMLResponse
 
-        from core.console import render_console
+        from a2a_hub.core.console import render_console
 
         return HTMLResponse(render_console())
 
@@ -1370,7 +1370,7 @@ class Hub:
     async def _run_plan(self, params: dict[str, Any]) -> dict[str, Any]:
         """编排入口：按显式 plan 跑一条流水线。
 
-        plan 由调用方给出（见 core/orchestrator.py 的说明），
+        plan 由调用方给出（见 a2a_hub/core/orchestrator.py 的说明），
         每一步都落库成一个 task 并挂上 plan_id / step_id，可事后完整追溯。
         """
         steps = params.get("steps")
@@ -1520,7 +1520,7 @@ class Hub:
     async def _cancel_task(self, params: dict[str, Any]) -> dict[str, Any]:
         """取消任务。
 
-        对 CLI 类 agent，会杀掉整棵进程树（见 adapters/cli.py 的 _kill）；
+        对 CLI 类 agent，会杀掉整棵进程树（见 a2a_hub/adapters/cli.py 的 _kill）；
         对 HTTP 类 agent 只能中断本地请求，下游服务端的执行不受影响。
         """
         task_id = params.get("id") or params.get("taskId")
@@ -1664,12 +1664,12 @@ class Hub:
         adapter: Adapter | None = None
 
         if record.kind == "a2a_http" and record.endpoint:
-            from adapters.a2a_http import A2AHttpAdapter
+            from a2a_hub.adapters.a2a_http import A2AHttpAdapter
 
             adapter = A2AHttpAdapter(record.name, record.endpoint)
 
         elif record.kind == "cli":
-            from adapters import cli as cli_mod
+            from a2a_hub.adapters import cli as cli_mod
 
             spec = record.config or {}
             factory = getattr(cli_mod, str(spec.get("adapter") or ""), None)

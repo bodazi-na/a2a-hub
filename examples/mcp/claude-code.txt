@@ -1,12 +1,13 @@
 # Claude Code：一条命令接入（等价于写进 ~/.claude.json 的 mcpServers）
 
 claude mcp add a2a-hub \
-  --env PYTHONPATH="<A2A_HUB_DIR>" \
+  --env PYTHONPATH="<A2A_HUB_DIR>/src" \
   --env HUB_URL="http://127.0.0.1:9200" \
-  -- <PYTHON> -m mcp_facade
+  -- <PYTHON> -m a2a_hub.mcp_facade
 
 # 验证：在 Claude Code 里执行
 #   /mcp            → 应能看到 a2a-hub 及其 6 个工具
 #
-# 说明：cwd 需为 <A2A_HUB_DIR>（facade 要能 import mcp_facade）。
-# Claude Code 的 mcp add 默认继承当前目录，所以在那之前先 cd 到 a2a-hub。
+# 说明：PYTHONPATH 要指向 **<A2A_HUB_DIR>/src** —— 包在 src 布局下，
+# 指向仓库根的话 import 不到 a2a_hub。
+# （装过 `pip install -e .` 之后可以省掉 PYTHONPATH，直接用 -m a2a_hub.mcp_facade。）

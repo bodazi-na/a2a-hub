@@ -20,6 +20,40 @@
 | **`synchronous=NORMAL`** | 断电可能丢掉最近若干事务（进程崩溃不丢） | 无需改动。若你的场景要求金融级持久性，请显式改回 `FULL` 并接受性能代价 |
 | **事务不可重入** | 在事务里再开事务会抛 `RuntimeError` | 只在写扩展时可能遇到。把多个写操作合成一个 `work()` |
 | **适配器接口新增 `on_event`（可选）** | `Adapter.call()` 多了个关键字参数。**老签名的适配器不会坏** —— hub 探测到不接受就不传，它们照常工作、只是推不了实时事件。见下方说明 | 想用实时流就加上 `on_event=None` 参数并在解析出事件时调用它；不加也能跑 |
+| **可导入路径全部变了** | 从 `from core.store import ...` 变成 `from a2a_hub.core.store import ...` | **只有当过库用才需要改**。命令行用法（`a2a-hub` / `python -m a2a_hub` / `python hub.py`）不受影响；MCP 接入的 `-m mcp_facade` 要改成 `-m a2a_hub.mcp_facade`，`PYTHONPATH` 指向 `<仓库根>/src` |
+
+### 重构：src 布局 + 单一顶层包
+
+**解决的问题**：以前 `hub` / `core` / `adapters` / `probes` / `mcp_facade` 是**五个顶层
+模块**，装进环境后会占据 site-packages 的顶层命名空间 —— `core` 这种名字几乎必然
+和别人撞车。当时的「解法」是让用户装独立虚拟环境，**那是把设计缺陷转嫁成用户的负担**。
+
+现在代码在 `src/a2a_hub/` 下，**装出去只占 `a2a_hub` 一个名字**：
+
+```python
+from a2a_hub.core.store import Store
+from a2a_hub.adapters.cli import DshCLI
+```
+
+顺带拿到的两个好处：
+
+- **`src/` 布局让「import 到工作目录里的同名文件」不可能发生** —— 测试验证的一定是
+  真正会被装出去的那份代码
+- **`pip install` 之后可以从任何目录用**（`a2a-hub serve` / `python -m a2a_hub serve`），
+  不再依赖 cwd
+
+仓库根保留了一个 `hub.py`（**不进安装包**），让文档里到处存在的 `python hub.py serve`
+继续可用。它内部把 `src/` 加进 `sys.path` 再转发到 `a2a_hub.cli`。
+
+**验收**（实测，不是推断）：
+
+- 构建 wheel → 顶层条目只有 `a2a_hub`，子包 `core` / `adapters` / `probes` / `mcp_facade`
+  都在它底下
+- 临时 venv 真实 `pip install` → site-packages 顶层只有 `a2a_hub` + 第三方依赖
+- 三个入口全通：`a2a-hub --help` / `python -m a2a_hub --help` / 从无关目录
+  `from a2a_hub.core.store import Store`
+- 打包 exe 照常构建并启动（26.7 MB / 76 文件，0.87s 就绪）
+- 测试：单元 + 平台 **13/13**，含集成 **19/19**
 
 ### 新增
 
@@ -223,7 +257,7 @@
 ### 文档
 
 - `docs/architecture.md` —— 分层、数据流、扩展点、数据库
-- `docs/adr/` —— 7 条架构决策记录（含被否决的方案与理由）
+- `docs/adr/` —— 8 条架构决策记录（含被否决的方案与理由）
 - `CONTRIBUTING.md` —— 三档测试、写适配器、提交约定
 - `docs/drill-2026-10-06-real-load.md` —— 一次真实负载演练的完整记录
 - **`README.en.md` —— 英文版 README**，与中文版内容对齐，两边顶部各有语言切换链接。

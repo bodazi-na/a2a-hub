@@ -68,7 +68,7 @@ class MyToolCLI(CLIAdapter):
 
 下游是 HTTP 就继承 `Adapter`，实现 `call()` 与 `probe()`。
 
-**② 在 `adapters/__init__.py` 导出它。**
+**② 在 `src/a2a_hub/adapters/__init__.py` 导出它。**
 
 **③ 写一份配置样例到 `examples/agents/`**（**用占位符，不要写本机真实路径**）。
 

@@ -32,7 +32,7 @@ mcp = ["mcp>=2.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-a2a-hub = "hub:main"
+a2a-hub = "a2a_hub.cli:main"
 
 # 之前这里是占位符 https://github.com/your-org/a2a-hub，已去掉 ——
 # 指向不存在仓库的 URL 比没有更糟。现在仓库真的建好了，补上真实地址。
@@ -46,9 +46,22 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-# hub.py 是入口脚本；其余是包
-py-modules = ["hub"]
-packages = ["core", "adapters", "probes", "mcp_facade"]
+# ---- src 布局 ----------------------------------------------------------
+#
+# 代码在 src/a2a_hub/ 下，装进环境后**顶层只占 `a2a_hub` 一个名字**。
+#
+# 以前是 `py-modules = ["hub"]` + `packages = ["core", "adapters", "probes",
+# "mcp_facade"]` —— 也就是往 site-packages 顶层塞了五个名字，其中 `core` 和
+# `adapters` 这种通用名几乎必然和别人撞车。当时的「解法」是让用户装独立 venv
+# （README 里写着），那是**把设计缺陷转嫁成用户的负担**。
+#
+# 现在不用了：`pip install a2a-hub` 只多出一个 `a2a_hub`。
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# 连 `a2a_hub.core` 这些子包一起收；排除测试与打包脚本。
+include = ["a2a_hub*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

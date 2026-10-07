@@ -45,9 +45,12 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
+# 不是仓库根 —— 仓库根下已经没有可导入的包了。
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
 
-from core.store import Store                                        # noqa: E402
+from a2a_hub.core.store import Store                                        # noqa: E402
 
 # 批量写入的条数。取大一点是为了让「退化回逐条事务」这种情况
 # 拉开足够大的差距，不至于被机器快慢掩盖。
@@ -188,10 +191,10 @@ async def test_execute_uses_batch_not_per_message() -> bool:
     这条比计时可靠 —— 不受机器快慢影响，直接盯住「修复有没有被改回去」。
     """
     print("\n[结构] _execute 落事件必须走批量（逐条次数不随事件数增长）")
-    from adapters.base import Adapter, CallResult, Event            # noqa: E402
-    from core.hub_app import Hub                                    # noqa: E402
-    from core.registry import AgentRecord, Registry                 # noqa: E402
-    from core.router import Router                                  # noqa: E402
+    from a2a_hub.adapters.base import Adapter, CallResult, Event            # noqa: E402
+    from a2a_hub.core.hub_app import Hub                                    # noqa: E402
+    from a2a_hub.core.registry import AgentRecord, Registry                 # noqa: E402
+    from a2a_hub.core.router import Router                                  # noqa: E402
 
     async def run_once(n_events: int, tag: str) -> tuple[int, int]:
         class ManyEvents(Adapter):

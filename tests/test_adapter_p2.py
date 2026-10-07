@@ -23,11 +23,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
+# 不是仓库根 —— 仓库根下已经没有可导入的包了。
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "src"))
 
-from adapters.a2a_http import A2AHttpAdapter      # noqa: E402
-from core.registry import AgentRecord, Registry   # noqa: E402
-from core.store import Store                      # noqa: E402
+from a2a_hub.adapters.a2a_http import A2AHttpAdapter      # noqa: E402
+from a2a_hub.core.registry import AgentRecord, Registry   # noqa: E402
+from a2a_hub.core.store import Store                      # noqa: E402
 
 CARD = {
     "name": "fake-downstream",

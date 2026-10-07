@@ -56,6 +56,7 @@ UNIT = [
     ("test_isolation", "隔离（假适配器，不执行 CLI）"),
     ("test_streaming", "流式 SSE：边跑边到 / 时间戳=发生时刻 / 背压（假适配器）"),
     ("test_parallelism", "并行度：分层推断 / 平均与峰值 / 空闲率（纯函数）"),
+    ("test_no_stale_refs", "守卫：仓库里没有残留的旧布局导入/调用（纯文本扫描）"),
 ]
 
 # 平台级：会**真的起进程**（用 sys.executable，不依赖任何外部 CLI），

@@ -53,9 +53,10 @@ jobs:
       - name: 验证 facade 可导入且工具注册完整
         run: |
           python - <<'PY'
-          import os, sys
-          sys.path.insert(0, ".")
-          from mcp_facade.server import server
+          import sys
+          # **不往 sys.path 里塞任何东西** —— 这一步要验证的就是「装完之后能用」，
+          # 塞路径会把「安装坏了」掩盖成「本地能跑」。
+          from a2a_hub.mcp_facade.server import server
           tools = {t.name for t in server._tool_manager.list_tools()}
           expected = {"hub_status","hub_agents","hub_send","hub_plan","hub_trace","hub_tasks"}
           missing = expected - tools
@@ -65,6 +66,12 @@ jobs:
               sys.exit(1)
           print("OK")
           PY
+
+      - name: 验证命令行入口（console script + -m）
+        run: |
+          a2a-hub --help > /dev/null
+          python -m a2a_hub --help > /dev/null
+          echo "两个入口都可用"
 
 # 说明：集成级自检（test_cli_direct / test_cli_lifecycle / test_kill_tree /
 # test_async_cancel / test_p1_fixes / test_mcp_facade）**不在 CI 里跑** ——

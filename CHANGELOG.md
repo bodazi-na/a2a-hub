@@ -244,6 +244,31 @@ from a2a_hub.adapters.cli import DshCLI
 `--token ""` 不能当认证、`HUB_TOKEN` 环境变量、`--allow-insecure` 豁免后仍打警告、
 重定向时横幅不丢、以及配了认证后认证本身真的拦得住（公开面最小化 + 路径变体 fail closed）。
 
+**CI 的 `mcp facade 可安装` 因 src 布局改红（2026-10-07）**
+
+`unit` 四格（ubuntu/windows × py3.10/3.13）全绿，只有 `mcp facade 可安装` 挂了。
+真实原因是那一步还在按旧路径导入：
+
+```python
+sys.path.insert(0, ".")
+from mcp_facade.server import server      # ← 已收进 a2a_hub.mcp_facade
+```
+
+修两处：改成 `from a2a_hub.mcp_facade.server import server`；
+**并删掉 `sys.path.insert(0, ".")`** —— 这一步要验证的正是「装完之后能用」，
+往 `sys.path` 里塞路径会把「安装坏了」掩盖成「本地能跑」。另外补一步验证
+命令行入口（`a2a-hub --help` 与 `python -m a2a_hub --help`）都能跑。
+
+**顺带补一条守卫**：`tests/test_no_stale_refs.py`（单元级，3 项断言）。
+
+「重构后残留旧引用」这件事**已经漏了三次** —— `examples/mcp/*` 平台配置、
+`tests/test_mcp_facade.py`、以及这次的 CI。三次都不是难发现，而是**没有任何东西
+会替你发现**：单元测试全绿、本地跑得好好的，只有真的去用那个入口才暴露。
+
+守卫只扫**非 Markdown** 的可执行/配置文件（README / CHANGELOG / ADR 里会正当
+引用旧写法，扫进去只制造假警报），且只认两种精确形态：导入语句与 `-m <模块>` 调用。
+它自己也带一组坏样本/好样本自检 —— **一个永远返回空清单的扫描器，看起来和全绿一模一样**。
+
 ### 性能
 
 | 项 | 改前 | 改后 |

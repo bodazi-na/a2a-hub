@@ -817,7 +817,7 @@ python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑�
 
 | 档 | 数量 | 依赖 |
 | --- | --- | --- |
-| 单元级 | 12 套 | 无（假适配器 + 内存 Store） |
+| 单元级 | 13 套 | 无（假适配器 + 内存 Store） |
 | 平台级 | 2 套 | 会起真实进程，但只用 `sys.executable`；非 Windows 自动跳过 |
 | 集成级 | 6 套 | 真实 CLI / Windows 进程命令 / hub 在跑 |
 

@@ -910,7 +910,7 @@ python tests/run_all.py --all    # add integration (needs real CLIs / a running 
 | Tier | Count | Dependencies |
 | --- | --- | --- |
 | Unit | 12 suites | None (fake adapters + in-memory Store) |
-| Platform | 1 suite | Spawns real processes, but only `sys.executable`; auto-skips off Windows |
+| Platform | 2 suites | Spawns real processes, but only `sys.executable`; auto-skips off Windows |
 | Integration | 6 suites | Real CLIs / Windows process commands / a running hub |
 
 ## Documentation

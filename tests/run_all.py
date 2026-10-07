@@ -65,6 +65,7 @@ UNIT = [
 # 靠的是「不碰真实进程」。把进程测试混进去会让那条约束失效。
 PLATFORM = [
     ("test_job_object", "Job Object 收进程树（需 Windows，非 Windows 跳过）"),
+    ("test_startup_guard", "启动护栏：非回环+无认证必须拒绝（起真实进程）"),
 ]
 
 # 集成级：需要真实 CLI / 系统命令 / hub 在跑

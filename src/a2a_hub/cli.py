@@ -60,25 +60,33 @@ from a2a_hub.core.store import Store                   # noqa: E402
 DEFAULT_DB = ROOT / "data" / "hub.db"
 
 
-def _force_utf8_output() -> None:
-    """把 stdout / stderr 固定成 UTF-8。
+def _configure_stdio() -> None:
+    """把 stdout / stderr 固定成 UTF-8，并让 stdout **行缓冲**。
 
-    为什么必须显式做：Python 在 Windows 上**重定向**输出时用系统代码页
-    （中文 Windows 是 GBK），于是日志里的中文变乱码。实测冻结成 exe 后
-    `(来自 Agent Card)` 输出成 `(\\xc0\\xb4\\xd7\\xd4 Agent Card)`。
+    编码：Python 在 Windows 上**重定向**输出时用系统代码页（中文 Windows 是
+    GBK），于是日志里的中文变乱码。实测冻结成 exe 后 `(来自 Agent Card)` 输出成
+    `(\\xc0\\xb4\\xd7\\xd4 Agent Card)`。源码运行时通常踩不到 —— 开发环境一般设了
+    `PYTHONUTF8=1` / `PYTHONIOENCODING`，而**冻结后的 exe 不认这两个变量**。
+    所以「我这儿跑着好好的」不能说明用户双击时也正常。
 
-    源码运行时通常踩不到 —— 因为开发环境一般设了 `PYTHONUTF8=1` /
-    `PYTHONIOENCODING`，而**冻结后的 exe 不认这两个变量**。所以
-    「我这儿跑着好好的」不能说明用户双击时也正常。
+    缓冲：**重定向时 stdout 是块缓冲的**（4~8KB 才刷一次），于是启动横幅
+    ——**包括那条「服务裸露在网络上」的安全警告**——在日志里一行都看不到，
+    直到缓冲区满或进程退出。实测：`serve --allow-insecure` 重定向到管道时
+    `[hub]` 输出 **0 行**，加 `PYTHONUNBUFFERED=1` 才有 6 行。
 
-    固定成 UTF-8 而不是跟随系统代码页：这台工具的 HTTP / JSON 本来就是
-    UTF-8，日志跟它们保持一致比跟随一个历史代码页更有用。接真实控制台时
-    Windows 走的是 `WriteConsoleW`，本来就按 Unicode 处理，不受影响。
-    `errors="replace"` 保证遇到不可编码字符时也不会抛异常把 CLI 弄挂。
+    这个坑对安全提示是致命的：护栏文案里写着「--allow-insecure 确认要裸奔
+    （**会在日志里留永久警告**）」，而那条警告恰恰是最需要落进日志的一条。
+    行缓冲让它逐行落盘，代价可以忽略（CLI 输出量本来就小）。
+
+    固定成 UTF-8 而不是跟随系统代码页：这台工具的 HTTP / JSON 本来就是 UTF-8，
+    日志跟它们保持一致比跟随一个历史代码页更有用。接真实控制台时 Windows 走的是
+    `WriteConsoleW`，本来就按 Unicode 处理，不受影响。`errors="replace"`
+    保证遇到不可编码字符时也不会抛异常把 CLI 弄挂。
     """
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace",
+                               line_buffering=True)
         except (AttributeError, ValueError, OSError):
             pass          # 被重定向到不支持 reconfigure 的对象，跳过即可
 
@@ -234,9 +242,9 @@ def cmd_probe(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    # 在**任何输出之前**固定编码 —— 见 _force_utf8_output 的说明。
+    # 在**任何输出之前**固定编码与缓冲 —— 见 _configure_stdio 的说明。
     # 放在 main 而不是模块顶层：这样被当库 import 时不会去动调用方的 stdout。
-    _force_utf8_output()
+    _configure_stdio()
 
     # prog 固定成发行名。不写的话 argparse 会拿 sys.argv[0] 当名字 ——
     # 同一个命令可能显示成 `hub`（源码 shim）、`a2a-hub`（控制台脚本）

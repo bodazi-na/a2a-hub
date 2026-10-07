@@ -576,6 +576,36 @@ hit `/healthz`.)
 exe anywhere and the data goes with it — exactly the semantics a portable app should
 have.
 
+### Double-click launch: `start-hub.bat`
+
+**Double-clicking `a2a-hub.exe` does not work** — with no subcommand it just prints a
+usage error and exits (exit code 2). The build places a `start-hub.bat` next to the
+exe, so **double-click that instead**:
+
+```
+a2a-hub/
+├── a2a-hub.exe
+├── start-hub.bat     ← double-click this
+└── _internal/
+```
+
+What it does: start the server → wait until it is ready → open the browser at
+`/console`. The server runs in its own window, so **the log stays visible and Ctrl-C
+stops it**.
+
+```bat
+start-hub.bat          :: default port 9200
+start-hub.bat 9300     :: use another port
+```
+
+> **This .bat is deliberately ASCII-only.** cmd.exe parses .bat files using the
+> **system code page** (GBK/cp936 on Chinese Windows), so a UTF-8 batch file with
+> non-ASCII text turns into mojibake — and worse, a truncated multi-byte sequence can
+> break the parser and produce baffling errors. Putting `chcp 65001` at the top does
+> not save you: cmd has already started reading the file by then. The rest of the repo
+> is UTF-8; this one file is a deliberate exception (`.gitattributes` declares
+> `*.bat text eol=crlf`, because cmd needs CRLF line endings).
+
 ### Restricted directories: an environment pitfall for onefile
 
 **If the exe is placed in a directory restricted by security policy, onefile fails to

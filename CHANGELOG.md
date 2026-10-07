@@ -28,6 +28,14 @@
 - `packaging/hub.spec` + `tools/build_exe.py`：一条命令打成免安装 exe。
   **构建脚本会自动实测启动**并打一次 `/healthz` —— 构建成功不等于能跑
 - 目录版与单文件版都支持（`--onefile` / `--both`）
+- **`start-hub.bat` 启动器**：双击 exe 是起不来的（不带子命令只打一行用法错误、
+  退出码 2），构建时会在 exe 旁边放一个启动器 —— 双击它 = 起服务 + 等就绪 +
+  自动开浏览器，服务跑在自己的窗口里，日志可见、Ctrl-C 能停。
+  另加 `.gitattributes` 声明 `*.bat text eol=crlf`（cmd 需要 CRLF）
+
+  这个 `.bat` **刻意写成纯 ASCII**：cmd.exe 按**系统代码页**（中文 Windows 是
+  GBK）解析 .bat，带中文的 UTF-8 批处理会乱码，更糟的是截断的多字节序列可能
+  把解析器搞坏。开头加 `chcp 65001` 救不了 —— 那时 cmd 已经在读文件了。
 
 过程中修掉三个坑（都会写进代码注释）：
 

@@ -1,0 +1,26 @@
+# 行尾约定
+#
+# 为什么需要这个文件：仓库里混了两类「行尾有语义」的文件 ——
+#
+# 1. `.bat` / `.cmd`：**cmd.exe 需要 CRLF**。LF-only 的批处理在多数情况下
+#    能跑，但带 `goto` / 标签 / `pause` 时会出各种难查的怪问题。而 git 默认
+#    可能按平台规范化行尾，于是「在我这儿好好的」到别人机器上就变了。
+#    显式声明 `eol=crlf`，让 checkout 出来的一律是 CRLF。
+#
+# 2. 其余文本文件：统一 LF，避免 CRLF 混进来制造无意义的整文件 diff。
+#
+# 顺带一提：`.bat` 里的内容**必须是纯 ASCII**。cmd 按系统代码页（中文 Windows
+# 是 GBK）解析 .bat，带中文的 UTF-8 批处理会乱码、甚至把解析器搞坏。
+# 见 `packaging/start-hub.bat` 顶部的说明。
+
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别碰
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.db binary

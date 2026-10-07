@@ -79,7 +79,33 @@ def build(onefile: bool) -> Path:
     target = DIST / ("a2a-hub.exe" if onefile else "a2a-hub")
     if not target.exists():
         raise SystemExit(f"没找到产物：{target}")
+    _install_launcher(target)
     return target
+
+
+def _install_launcher(target: Path) -> None:
+    """把 `start-hub.bat` 放到 exe 旁边。
+
+    为什么要有它：**双击 exe 起不来界面** —— 不带子命令只会打一行用法错误
+    然后退出（退出码 2）。对一个定位成「绿色免安装」的东西来说，这个体验是
+    不合格的：用户期望双击就能用。
+
+    启动器做的事：起服务 → 等它就绪 → 自动开浏览器，并且**服务跑在它自己的
+    窗口里**，日志可见、Ctrl-C 就能停。
+
+    （另一条路是让不带子命令时默认 `serve`，那会改 CLI 语义 —— 留作备选。）
+    """
+    src = ROOT / "packaging" / "start-hub.bat"
+    if not src.exists():
+        print(f"  ! 没找到启动器模板 {src}，跳过")
+        return
+    dst_dir = target if target.is_dir() else target.parent
+    # **显式写 CRLF**：cmd.exe 需要它，而仓库里存的是 LF（见 .gitattributes
+    # 的 `*.bat text eol=crlf` —— 那条保证 checkout 出来是 CRLF，但构建时
+    # 可能是从工作区直接读的，所以这里再兜一次）。
+    text = src.read_text(encoding="ascii")
+    (dst_dir / "start-hub.bat").write_text(text, encoding="ascii", newline="\r\n")
+    print(f"  已放置启动器 start-hub.bat → {dst_dir}")
 
 
 def measure(target: Path) -> dict:

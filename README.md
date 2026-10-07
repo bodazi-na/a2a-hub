@@ -519,6 +519,33 @@ python tools/build_exe.py --both     # 两种都打并对比
 **数据跟着 exe 走**：`data/hub.db`、`workspace/` 都在 exe 旁边。exe 拷到哪、
 数据就在哪 —— 这正是「绿色免安装」该有的语义。
 
+### 双击启动：`start-hub.bat`
+
+**双击 `a2a-hub.exe` 是起不来的** —— 不带子命令只会打一行用法错误然后退出
+（退出码 2）。构建时会在 exe 旁边放一个 `start-hub.bat`，**双击它就行**：
+
+```
+a2a-hub/
+├── a2a-hub.exe
+├── start-hub.bat     ← 双击这个
+└── _internal/
+```
+
+它做的事：起服务 → 等就绪 → 自动打开浏览器到 `/console`。
+服务跑在它自己的窗口里，**日志可见、Ctrl-C 就能停**。
+
+```bat
+start-hub.bat          :: 默认 9200
+start-hub.bat 9300     :: 换端口
+```
+
+> **这个 .bat 是纯 ASCII 的，是刻意的。** cmd.exe 按**系统代码页**
+> （中文 Windows 是 GBK）解析 .bat，带中文的 UTF-8 批处理会乱码，
+> 更糟的是截断的多字节序列可能把解析器搞坏、报出莫名其妙的错。
+> 开头加 `chcp 65001` 也救不了 —— 那时 cmd 已经在读这个文件了。
+> 仓库其余部分是 UTF-8，这一个是刻意的例外（`.gitattributes` 里声明了
+> `*.bat text eol=crlf`，因为 cmd 需要 CRLF 行尾）。
+
 ### 受限目录：单文件版的一个环境坑
 
 **如果 exe 放在受安全策略限制的目录里，单文件版会启动失败**：

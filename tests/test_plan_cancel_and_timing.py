@@ -30,7 +30,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from adapters.base import Adapter, CallResult                    # noqa: E402
-from core.hub_app import Hub, _duration_ms                       # noqa: E402
+from core.hub_app import Hub, _duration_ms, _task_started_at     # noqa: E402
 from core.registry import AgentRecord, Registry                  # noqa: E402
 from core.router import Router                                   # noqa: E402
 from core.store import Store                                     # noqa: E402
@@ -295,10 +295,53 @@ async def test_gather_cancel_semantics() -> bool:
     return all(checks.values())
 
 
+async def test_started_at_excludes_queue_wait() -> bool:
+    """`started_at` 必须在**取得并发名额之后**才打 —— 排队时间不算执行时间。
+
+    修复前它打在 `_execute` 开头，于是负载超过并发上限时，「排队等名额」的
+    时间被记成 Agent 正在执行。并行度分析据此构造运行区间，指标会虚高
+    （把排队中的任务也算成「在跑」）。
+    """
+    print("\n[N2+] 计时起点不含排队等并发名额的时间")
+    slow = SlowAdapter("slow", delay=0.5)
+    hub, store = build_hub(fresh_db("queue"), {"slow": slow})
+    hub.max_concurrency = 1                     # 逼出排队（信号量是延迟创建的）
+
+    t1 = asyncio.create_task(hub.dispatch_task("a", agent="slow"))
+    await asyncio.sleep(0.15)                   # 让第一个先占住名额
+    t2 = asyncio.create_task(hub.dispatch_task("b", agent="slow"))
+    await asyncio.gather(t1, t2)
+
+    rows = sorted(store.list_tasks(limit=10), key=lambda r: r["created_at"])
+    if len(rows) < 2:
+        print(f"  ✗ 只查到 {len(rows)} 个任务")
+        return False
+    first, second = rows[0], rows[1]
+    d1 = _duration_ms(_task_started_at(first), first.get("finished_at"))
+    d2 = _duration_ms(_task_started_at(second), second.get("finished_at"))
+    print(f"  并发上限 1，两个 0.5s 任务")
+    print(f"    先到的: started={_task_started_at(first)}  时长={d1}ms")
+    print(f"    后到的: started={_task_started_at(second)}  时长={d2}ms")
+
+    # 后到的那个真实执行只有 ~500ms。修复前它会把 ~150ms 的排队也算进去，
+    # 时长逼近 650ms+；更重要的是它的 started_at 会早于前一个的 finished_at。
+    started_ok = _task_started_at(second) >= first.get("finished_at")
+    print(f"  后到者 started_at ≥ 先到者 finished_at: {started_ok}")
+    if not started_ok:
+        print("  ✗ 排队中的任务被当成「已经开始执行」")
+        return False
+    if d2 is None or d2 > 700:
+        print(f"  ✗ 后到者时长 {d2}ms 明显含排队时间")
+        return False
+    print("  ✓ 计时起点在取得名额之后，排队时间未计入")
+    return True
+
+
 async def main() -> int:
     cases = [
         ("N1 编排 step 取消到达下游", test_plan_step_cancel_reaches_downstream),
         ("N2 计时基准排除层间等待", test_plan_step_timing_excludes_layer_wait),
+        ("N2+ 计时起点排除排队等名额", test_started_at_excludes_queue_wait),
         ("P1-5 整轮取消结算占位任务", test_caller_cancel_settles_placeholders),
         ("P1-1 gather 取消语义", test_gather_cancel_semantics),
     ]

@@ -428,6 +428,8 @@ async function loadAll() {
 // 用 fetch + ReadableStream 读 SSE，而**不是** EventSource：
 // EventSource 只能发 GET，带不了 message 体。原生 API，依旧零依赖。
 let liveAbort = null;
+// 本次流里已经报过的累计丢弃条数。服务端送的是累计值，前端只报增量。
+let liveDropped = 0;
 
 function renderLiveAgents() {
   const sel = $("#live-agent");
@@ -460,12 +462,17 @@ function handleFrame(frame, t0, agent) {
     const su = r.statusUpdate, md = su.metadata || {}, st = su.status || {};
     let text = "";
     for (const part of ((st.message || {}).parts || [])) text += part.text || "";
-    // 服务器在跟不上时会丢事件并带上累计 dropped —— 如实标出断点，
-    // 不假装自己看到的是完整过程。
-    if (md.dropped) {
+    // 服务器在跟不上时会丢事件并带上 dropped —— 如实标出断点，不假装完整。
+    //
+    // 注意 `dropped` 是**累计值**：直接判「非零」会变成每帧都插一条提示，
+    // 慢客户端一旦丢过事件，之后每一帧都在刷同一句话。只报**本次新增**的条数。
+    const dropped = md.dropped || 0;
+    if (dropped > liveDropped) {
+      const delta = dropped - liveDropped;
+      liveDropped = dropped;
       feed.insertAdjacentHTML("beforeend",
         `<div class="row"><span class="t">${esc(t)}</span><span></span>
-         <span class="gap">…中间丢了 ${md.dropped} 条事件（客户端读得太慢）</span></div>`);
+         <span class="gap">…中间丢了 ${delta} 条事件（客户端读得太慢）</span></div>`);
     }
     feed.insertAdjacentHTML("beforeend", liveRow(t, agent, md.kind, short(text, 220)));
   } else if (r.task) {
@@ -484,6 +491,7 @@ function startLive() {
   stopLive();
   const ctrl = new AbortController();
   liveAbort = ctrl;
+  liveDropped = 0;                       // 新流重新计数
   $("#live-feed").innerHTML = "";
   $("#live-start").disabled = true;
   $("#live-stop").disabled = false;
@@ -517,13 +525,23 @@ function startLive() {
         buf = buf.slice(i + 2);
       }
     }
-    $("#live-status").textContent = "流已结束。";
+    if (liveAbort === ctrl) $("#live-status").textContent = "流已结束。";
   }).catch((e) => {
-    if (e.name !== "AbortError") $("#live-status").textContent = "出错：" + e.message;
+    if (e.name !== "AbortError" && liveAbort === ctrl) {
+      $("#live-status").textContent = "出错：" + e.message;
+    }
   }).finally(() => {
-    liveAbort = null;
-    $("#live-start").disabled = false;
-    $("#live-stop").disabled = true;
+    // **只清理自己这一条流。**
+    //
+    // 旧请求的 `finally` 可能在新请求已经起来之后才跑到（用户快速重派就会）。
+    // 无条件清空的话，新流的 AbortController 会被抹掉 —— 「断开」按钮从此
+    // 停不下它，而且按钮状态也会被旧流改回错误的样子。
+    // 同理，上面的状态文字也要判一下归属，别把新流的提示覆盖掉。
+    if (liveAbort === ctrl) {
+      liveAbort = null;
+      $("#live-start").disabled = false;
+      $("#live-stop").disabled = true;
+    }
   });
 }
 

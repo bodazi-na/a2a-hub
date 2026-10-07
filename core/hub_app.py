@@ -114,6 +114,30 @@ async def _single_frame_stream(req_id: Any, task: dict[str, Any]):
     yield _sse_frame(req_id, {"task": task})
 
 
+async def _error_frame_stream(req_id: Any, code: int, message: str):
+    """把 JSON-RPC 错误包成一条 SSE 帧。
+
+    为什么不让它走普通的 JSON 错误响应：客户端请求的是 `text/event-stream`，
+    收到 JSON 会解析失败，反而把「timeout 不合法」这个**明确原因**盖成
+    「解析错误」。保持在流里送，错误就还是可读的。
+
+    为什么必须有它：流式方法原先在 `rpc()` 的 try **之外**，参数异常会直接
+    冒泡成 **HTTP 500** —— 客户端拿到的是「服务器炸了」，而真实原因只是
+    一个不合法的 timeout。
+    """
+    payload = {"jsonrpc": "2.0", "id": req_id,
+               "error": {"code": code, "message": message}}
+    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _sse_error_response(req_id: Any, code: int, message: str) -> "StreamingResponse":
+    return StreamingResponse(
+        _error_frame_stream(req_id, code, message),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
 # 适配器的 call 是否接受 on_event —— 按**类**缓存（同类实例签名一样）。
 #
 # 这是**兼容性护栏**：`on_event` 是后加的，而 `Adapter.call` 是抽象方法，
@@ -389,11 +413,27 @@ class Hub:
         self._context_locks: dict[tuple[str, str], asyncio.Lock] = {}
         # 实时事件总线：task_id -> 订阅者集合（见 subscribe/_publish）
         self._subs: dict[str, set[_Subscriber]] = {}
+        # 已推给订阅者、但还没落库的过程事件：task_id -> [Event]。
+        #
+        # 为什么要这个缓冲：事件以前只在 `_settle_result` 落一次库，于是
+        #   (1) 运行中重连的客户端**补不回**尚未落库的进度 —— 它回放的是库里的
+        #       内容，而库里还没有这些事件；
+        #   (2) 任务被取消时，`adapter.call` 从未返回、`result.events` 根本不存在，
+        #       于是**已经推送出去的事件永久不入 history** —— 流里有、审计里没有。
+        # 现在改成「边跑边攒、在几个关键时刻落库」，见 `_flush_events`。
+        self._pending_events: dict[str, list[Any]] = {}
+        # 每个任务已经落库的过程事件条数。用于结算时**只补写剩下的**，
+        # 避免「flush 过一次 + 结算时再写一遍 result.events」造成重复。
+        self._flushed_count: dict[str, int] = {}
         self._sem: asyncio.Semaphore | None = None
         self.orchestrator = Orchestrator(self)
         self.auth_token = (auth_token or "").strip() or None
-        # 下游 agent 的工作目录：默认 <cwd>/workspace，与代码目录隔离。
-        # 不让 CLI agent 把产物写进仓库，这是「代码」与「运行时数据」的分界。
+        # 下游 agent 的工作目录：与代码目录隔离，不让 CLI agent 把产物写进仓库。
+        #
+        # **入口（hub.py）会显式传 ROOT/workspace**，这里的 cwd 只是给「把 Hub
+        # 当库用」的场景兜底。默认值之所以不能指望，是因为双击 exe 时 cwd 是
+        # 「当时碰巧在哪」—— 桌面、C:\Windows\System32 都可能，于是 workspace/
+        # 就散落在那种地方。
         self.workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd() / "workspace"
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
@@ -431,6 +471,36 @@ class Hub:
         subs.discard(sub)
         if not subs:
             self._subs.pop(task_id, None)
+
+    def _flush_events(self, task_id: str) -> int:
+        """把待落库的过程事件写进库，返回本次写入条数。
+
+        调用时机有三处，缺一处就会留下一类不一致：
+
+        - **订阅时**：先把已发生但还没落库的事件写下去，再做历史回放 ——
+          否则重连的客户端补不回这一段进度
+        - **结算时**：写掉剩余部分（`_settle_result` 里只补写没写过的那些）
+        - **取消 / 异常时**：`adapter.call` 从未返回，但事件已经推给客户端了；
+          不落库就变成「流里有、审计里没有」
+
+        `created_at` 用事件**自己的发生时刻**（适配器打的 `ts`），不是落库时刻 ——
+        这是 N5 的修复，别在这里退回去。
+        """
+        pending = self._pending_events.pop(task_id, None)
+        if not pending:
+            return 0
+        self.store.add_messages(task_id, [
+            {
+                "role": "agent",
+                "kind": event.kind,
+                "content": [{"text": event.text}],
+                "metadata": event.metadata,
+                "created_at": event.ts,
+            }
+            for event in pending
+        ])
+        self._flushed_count[task_id] = self._flushed_count.get(task_id, 0) + len(pending)
+        return len(pending)
 
     def _publish(self, task_id: str, payload: dict[str, Any]) -> None:
         """把一条事件推给该任务的所有订阅者。
@@ -686,8 +756,21 @@ class Hub:
             return self._rpc_error(req_id, -32601, f"Method not found: {method}")
         # 流式单独分流：它的签名与其它方法不同（要返回 StreamingResponse 而不是
         # dict），塞进 handlers 表会让调用方对返回类型的假设失效。
+        #
+        # **必须同样纳入错误处理**：以前这里裸调，参数不合法（例如非法 timeout）
+        # 会直接冒泡成 HTTP 500 —— 客户端看到的是「服务器炸了」，而真实原因只是
+        # 一个参数写错了。现在把错误包成一条 SSE 帧送回去，保持流式语义。
         if method in ("SendStreamingMessage", "message/stream"):
-            return await self._send_streaming_message(req_id, params)
+            try:
+                return await self._send_streaming_message(req_id, params)
+            except NoRouteError as exc:
+                return _sse_error_response(req_id, -32001, f"No route: {exc}")
+            except LookupError as exc:
+                return _sse_error_response(req_id, -32004, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                return _sse_error_response(
+                    req_id, -32603, f"{type(exc).__name__}: {exc}"
+                )
         try:
             result = await handler(params)
         except NoRouteError as exc:
@@ -849,6 +932,9 @@ class Hub:
         # **先订阅再派活/回放**：反过来的话，两步之间产生的事件会永久丢失。
         # 代价是可能重复，所以回放时记下 (kind, ts)，把队列里已出现过的丢掉。
         sub = self.subscribe(task_id)
+        # 订阅之后、回放之前，先把「已发生但还没落库」的事件写下去 ——
+        # 否则运行中重连的客户端只能看到上次结算时的进度，中间那段补不回来。
+        self._flush_events(task_id)
 
         async def gen():
             try:
@@ -1034,13 +1120,16 @@ class Hub:
         # 「真正开始执行」的时刻。**与 created_at 区分开**：编排层会预先为每个
         # step 落占位任务，记录在 plan 开始那一刻就诞生了，但这一层可能几分钟后
         # 才轮到它。拿 created_at 当开始时刻，层间排队等待会被算进执行时长（N2）。
-        # 带 only_from：任务若在派活前就已被取消，不该再补 started_at。
-        self.store.update_task(task_id, started=True, only_from=ACTIVE_STATES)
+        #
+        # **位置很关键：必须在取得会话锁与并发名额之后**（见下面 `_semaphore` 那段）。
+        # 原来打在函数开头，于是「排队等并发名额」的时间也被记成执行时间 ——
+        # 负载超过并发上限时，并行度分析会把排队的任务算成「Agent 正在运行」，
+        # 指标虚高。它的名字叫「真正开始执行」，就该在执行真开始时打。
 
-        # 实时事件回调：下游每解析出一条过程事件就立刻推给订阅者。
-        # **它不替代持久化** —— 事件照常收集进 result.events 并落库。流只是
-        # 「额外多一条路」：订阅者断线不影响任务，任务结束也不影响订阅者。
+        # 实时事件回调：下游每解析出一条过程事件就立刻推给订阅者，
+        # 同时攒进待落库缓冲（见 `_flush_events` 说明为什么不能只等结算时写）。
         async def _on_event(event: Any) -> None:
+            self._pending_events.setdefault(task_id, []).append(event)
             self._publish(task_id, {
                 "kind": event.kind, "text": event.text, "ts": event.ts,
             })
@@ -1086,6 +1175,9 @@ class Hub:
                     "kind": "status", "state": "working",
                     "text": f"dispatched to {record.name}",
                 })
+                # 到这里才是「真正开始执行」：状态已抢到、锁与并发名额都已取得。
+                # 带 only_from：任务若在派活前就已被取消，不该再补 started_at。
+                self.store.update_task(task_id, started=True, only_from=ACTIVE_STATES)
                 # 拿锁之后再读 session，保证读到的是最新的
                 if context_id:
                     session_id = self.store.get_context_session(context_id, record.name)
@@ -1135,6 +1227,10 @@ class Hub:
             # 任务就永远停在 working 了（M4）。
             await self._settle_result(task_id, record, result)
         except asyncio.CancelledError:
+            # **先把已推送的事件落库再写取消状态**：`adapter.call` 从未返回，
+            # `result.events` 不存在，但那些事件早就在流里推给客户端了。
+            # 不落库就是「流里有、审计里没有」—— 顺序上事件先于取消，所以先写。
+            self._flush_events(task_id)
             self.store.add_message(task_id, role="agent", kind="status",
                                    content=[{"text": "canceled by caller"}])
             self.store.update_task(task_id, state="canceled",
@@ -1147,6 +1243,11 @@ class Hub:
             raise
         except Exception as exc:  # noqa: BLE001
             detail = f"{type(exc).__name__}: {exc}"
+            # 同样：先把已推送的事件落库，别让它们随异常一起消失
+            try:
+                self._flush_events(task_id)
+            except Exception:                      # noqa: BLE001
+                pass          # 落库本身失败不能再把异常路径弄挂，下面还要写终态
             settled = self.store.update_task(
                 task_id, state="failed", error=detail, finished=True,
                 only_from=ACTIVE_STATES,
@@ -1200,19 +1301,27 @@ class Hub:
         # 50 个事件实测把事件循环硬阻塞 193ms，这期间连 CancelTask 都调度不了（M2）。
         # 合成一个事务后 0.9ms。
         if result.events:
-            self.store.add_messages(task_id, [
-                {
-                    "role": "agent",
-                    "kind": event.kind,
-                    "content": [{"text": event.text}],
-                    "metadata": event.metadata,
-                    # **用事件的发生时刻**，不是落库时刻。适配器在解析出这条事件
-                    # 时就打好了 ts；以前这里不传，store 统一填「插入时刻」，
-                    # 于是整批事件的时间戳挤在几毫秒内，时序全丢（N5）。
-                    "created_at": event.ts,
-                }
-                for event in result.events
-            ])
+            # 先落「边跑边攒」的那批，再补写剩下的。
+            #
+            # 为什么要区分：支持 `on_event` 的适配器（CLI / HTTP）每产出一条就
+            # 已进过待落库缓冲；这里如果整份 `result.events` 再写一遍就会重复。
+            # 不支持 `on_event` 的适配器缓冲是空的，`_flushed_count` 为 0，
+            # 于是整份写下去 —— 两条路都不会漏也不会重。
+            self._flush_events(task_id)
+            already = self._flushed_count.pop(task_id, 0)
+            rest = result.events[already:]
+            if rest:
+                self.store.add_messages(task_id, [
+                    {
+                        "role": "agent",
+                        "kind": event.kind,
+                        "content": [{"text": event.text}],
+                        "metadata": event.metadata,
+                        # **用事件的发生时刻**，不是落库时刻（N5）
+                        "created_at": event.ts,
+                    }
+                    for event in rest
+                ])
 
         if result.ok:
             self.store.add_artifact(

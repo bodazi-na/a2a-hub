@@ -32,6 +32,8 @@ from adapters.base import (                                      # noqa: E402
     Event,
     utcnow,
 )
+from starlette.responses import StreamingResponse                # noqa: E402
+
 from core.hub_app import ACTIVE_STATES, Hub, SSE_QUEUE_MAX       # noqa: E402
 from core.registry import AgentRecord, Registry                  # noqa: E402
 from core.router import Router                                   # noqa: E402
@@ -65,6 +67,64 @@ class StreamingAdapter(Adapter):
             if on_event is not None:
                 await on_event(ev)          # 逐条推，不攒
         return CallResult(ok=True, text="done", events=events)
+
+
+class PacedAdapter(Adapter):
+    """按固定节奏吐事件，然后**再等一会儿**才返回。
+
+    那个「再等一会儿」是给测试留的窗口：此时事件已经推给客户端了，
+    但 `adapter.call` 还没返回 —— 正是「已推送、未落库」的那个状态。
+    """
+
+    kind = "test"
+
+    def __init__(self, name: str = "paced", steps: int = 3,
+                 gap: float = 0.15, tail: float = 0.6):
+        super().__init__(name)
+        self.steps = steps
+        self.gap = gap
+        self.tail = tail
+
+    async def probe(self) -> str:
+        return "ok"
+
+    async def call(self, prompt: str, *, context_id=None, session_id=None,
+                   timeout: float = 600.0, on_event=None) -> CallResult:
+        events: list[Event] = []
+        for i in range(self.steps):
+            await asyncio.sleep(self.gap)
+            ev = Event(kind=EVENT_THINKING, text=f"paced {i}", ts=utcnow())
+            events.append(ev)
+            if on_event is not None:
+                await on_event(ev)
+        await asyncio.sleep(self.tail)          # 留出「已推送未落库」的窗口
+        return CallResult(ok=True, text="done", events=events)
+
+
+class HangingAdapter(Adapter):
+    """吐几条事件后一直挂着，等着被取消。"""
+
+    kind = "test"
+
+    def __init__(self, name: str = "hanger", steps: int = 3, gap: float = 0.1):
+        super().__init__(name)
+        self.steps = steps
+        self.gap = gap
+        self.entered = asyncio.Event()
+
+    async def probe(self) -> str:
+        return "ok"
+
+    async def call(self, prompt: str, *, context_id=None, session_id=None,
+                   timeout: float = 600.0, on_event=None) -> CallResult:
+        for i in range(self.steps):
+            await asyncio.sleep(self.gap)
+            ev = Event(kind=EVENT_THINKING, text=f"hang {i}", ts=utcnow())
+            if on_event is not None:
+                await on_event(ev)
+        self.entered.set()
+        await asyncio.sleep(3600)
+        return CallResult(ok=True, text="never")
 
 
 class SlowSubscriberAdapter(StreamingAdapter):
@@ -253,6 +313,122 @@ async def test_terminal_frame_is_full_task() -> bool:
     return True
 
 
+async def test_reconnect_replays_unsettled_events() -> bool:
+    """运行中接入应当能补回「已推送、还没落库」的进度。
+
+    修复前事件只在 `_settle_result` 落库一次，于是任务跑到一半时接入的客户端
+    回放出来是空的 —— 库里的进度停在「派活」那一条。
+    """
+    print("\n[重连] 运行中接入要能补回未落库的进度")
+    adapter = PacedAdapter(steps=3, gap=0.12, tail=1.0)
+    hub, store = build_hub(fresh_db("reconnect"), {"paced": adapter})
+
+    resp = await hub._send_streaming_message("s1", _params("paced"))
+    gen = resp.body_iterator
+    task_id, seen = None, 0
+    while seen < 3:
+        payload = _parse(await gen.__anext__())
+        if payload is None:
+            continue
+        su = (payload.get("result") or {}).get("statusUpdate") or {}
+        if su:
+            task_id = su.get("taskId")
+            if (su.get("metadata") or {}).get("kind") == EVENT_THINKING:
+                seen += 1
+    await gen.aclose()                          # 断开第一条流
+
+    settled = [m for m in store.list_messages(task_id) if m["kind"] == EVENT_THINKING]
+    print(f"  断开时库里已有 {len(settled)} 条过程事件（此刻还没结算）")
+
+    # 以 taskId 接入同一个任务：回放应当带上刚才推过的那 3 条
+    resp2 = await hub._send_streaming_message("s2", {"taskId": task_id})
+    frames = await _drain(resp2)
+    replayed = sum(
+        1 for _t, p in frames
+        if ((p.get("result") or {}).get("statusUpdate") or {})
+        and (((p["result"]["statusUpdate"].get("metadata") or {}).get("kind"))
+             == EVENT_THINKING)
+    )
+    print(f"  重连后回放到 {replayed} 条过程事件")
+    if replayed < 3:
+        print("  ✗ 补不回已推送的进度")
+        return False
+    print("  ✓ 重连补回了尚未落库的进度")
+    return True
+
+
+async def test_cancel_preserves_streamed_events() -> bool:
+    """取消时，已经推送出去的事件必须落库。
+
+    修复前：`adapter.call` 从未返回 ⇒ `result.events` 不存在 ⇒ 那批事件
+    **永久不入 history** —— 客户端在流里看到了、审计里查不到。
+    """
+    print("\n[取消] 已推送的事件不能随取消一起消失")
+    adapter = HangingAdapter(steps=3, gap=0.06)
+    hub, store = build_hub(fresh_db("cancel"), {"hanger": adapter})
+
+    resp = await hub._send_streaming_message("s1", _params("hanger"))
+    gen = resp.body_iterator
+
+    # **必须先推一下生成器**：派活是在 gen() 内部 create_task 的，
+    # 不先 __anext__ 的话 _execute 根本没启动，等 entered 就是死等。
+    task_id, seen = None, 0
+    while seen < 3:
+        payload = _parse(await gen.__anext__())
+        if payload is None:
+            continue
+        su = (payload.get("result") or {}).get("statusUpdate") or {}
+        if su:
+            task_id = su.get("taskId")
+            if (su.get("metadata") or {}).get("kind") == EVENT_THINKING:
+                seen += 1
+    await asyncio.wait_for(adapter.entered.wait(), timeout=10)   # 确认真的挂住了
+
+    await hub._cancel_task({"id": task_id})
+    await asyncio.sleep(0.4)                    # 给结算一点时间
+    await gen.aclose()
+
+    n = sum(1 for m in store.list_messages(task_id) if m["kind"] == EVENT_THINKING)
+    state = (store.get_task(task_id) or {}).get("state")
+    print(f"  取消后状态 = {state}，库里过程事件 = {n} 条")
+    if n < 3:
+        print("  ✗ 已推送的事件丢了")
+        return False
+    print("  ✓ 已推送的事件保留在 history 里")
+    return True
+
+
+async def test_bad_timeout_returns_sse_error() -> bool:
+    """流式请求的参数错误应当回一条 SSE 错误帧，而不是 HTTP 500。
+
+    修复前流式方法在 `rpc()` 的 try 之外，参数异常直接冒泡 ——
+    客户端看到「服务器炸了」，真实原因只是一个写错的 timeout。
+    """
+    print("\n[协议] 流式请求的参数错误不能冒泡成 500")
+    hub, _store = build_hub(fresh_db("badtimeout"), {"streamer": StreamingAdapter()})
+
+    class _Req:
+        async def json(self):
+            return {"jsonrpc": "2.0", "id": "x", "method": "SendStreamingMessage",
+                    "params": {"agent": "streamer", "timeout": "not-a-number",
+                               "message": {"messageId": "m", "role": "ROLE_USER",
+                                           "parts": [{"text": "go"}]}}}
+
+    resp = await hub.rpc(_Req())
+    print(f"  响应类型 = {type(resp).__name__}")
+    if not isinstance(resp, StreamingResponse):
+        print("  ✗ 没有返回流式响应（异常冒泡了？）")
+        return False
+    frames = await _drain(resp)
+    err = frames[0][1].get("error") if frames else None
+    print(f"  错误帧 = {err}")
+    if not err:
+        print("  ✗ 流里没有错误帧")
+        return False
+    print("  ✓ 以 SSE 错误帧返回，不是 HTTP 500")
+    return True
+
+
 async def test_slow_subscriber_does_not_block_task() -> bool:
     """订阅者跟不上时，任务必须照常跑完 —— 队列有界、丢最老。"""
     print("\n[背压] 慢订阅者不能拖住任务")
@@ -337,6 +513,9 @@ async def main() -> int:
         ("帧随进展陆续到达", test_frames_arrive_incrementally),
         ("N5 事件时间戳=发生时刻", test_event_timestamps_are_occurrence_times),
         ("末帧是完整 Task", test_terminal_frame_is_full_task),
+        ("重连补回未落库进度", test_reconnect_replays_unsettled_events),
+        ("取消保留已推送事件", test_cancel_preserves_streamed_events),
+        ("非法 timeout 回 SSE 错误帧", test_bad_timeout_returns_sse_error),
         ("慢订阅者不拖住任务", test_slow_subscriber_does_not_block_task),
         ("老签名适配器仍可用（兼容护栏）", test_legacy_adapter_still_works),
         ("Agent Card 声明一致", test_agent_card_declares_streaming),

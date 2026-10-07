@@ -86,7 +86,12 @@ def build_hub(db_path: Path, *, auth_token: str | None = None) -> Hub:
     for rec in registry.list(enabled_only=False):
         if rec.kind == "a2a_http" and rec.endpoint:
             adapters[rec.name] = A2AHttpAdapter(rec.name, rec.endpoint)
-    hub = Hub(store, registry, router, adapters, auth_token=auth_token)
+    # 下游 agent 的工作目录**必须显式传**，不能用 Hub 的默认值（`Path.cwd()`）：
+    # 双击 exe 时 cwd 是「当时碰巧在哪」，可能是桌面、也可能是 C:\Windows\System32，
+    # 于是 workspace/ 就散落在那种地方。这里用 ROOT —— 它已经做了 frozen 判断，
+    # 源码运行时是仓库根、打包后是 exe 所在目录，两种形态行为一致。
+    hub = Hub(store, registry, router, adapters, auth_token=auth_token,
+              workspace_dir=str(ROOT / "workspace"))
     # 启动时结算上次进程遗留的活跃任务，别让它们永远卡在 working（A2A-09）
     orphans = hub.recover_orphans()
     if orphans:

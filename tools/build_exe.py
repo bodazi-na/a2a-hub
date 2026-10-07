@@ -34,6 +34,9 @@ DEFAULT_DIST = ROOT / "dist"
 
 # 实测启动时用的端口。避开默认 9200，免得撞上正在跑的开发实例。
 PROBE_PORT = 19280
+# 冒烟检查最多等多久（秒）。超了就判失败并打印进程输出 —— **必须有上界**，
+# 否则一个起不来的 exe 会把构建无限挂住。
+PROBE_TIMEOUT_SECONDS = 30
 
 # 本次运行的产物目录，由 --dist 覆盖（默认 <仓库>/dist）。
 DIST = DEFAULT_DIST
@@ -128,7 +131,7 @@ def _run_probe(exe: Path) -> dict:
     body = None
     output = ""
     try:
-        for _ in range(120):                      # 最多等 30 秒
+        for _ in range(PROBE_TIMEOUT_SECONDS * 4):    # 每轮 0.25s
             time.sleep(0.25)
             if proc.poll() is not None:
                 break
@@ -141,20 +144,26 @@ def _run_probe(exe: Path) -> dict:
                     break
             except Exception:                      # noqa: BLE001
                 continue
-        if ready_at is None and proc.stdout is not None:
-            try:
-                output = proc.stdout.read() or ""
-            except Exception:                      # noqa: BLE001
-                pass
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        # **先终止再读输出**。反过来的话，进程还活着时 `read()` 会一直等到
+        # 它退出 —— 健康检查失败（进程其实在正常服务、只是接口没通）时就是
+        # 「无限等待」，冒烟检查反倒把整个构建挂住。实测踩到过。
+        if ready_at is None and proc.stdout is not None:
+            try:
+                output = proc.stdout.read() or ""
+            except Exception:                      # noqa: BLE001
+                pass
         # 刚终止的进程还握着 SQLite 文件句柄，Windows 释放要一点点时间。
-        # 不睡这一下，临时目录清理会报 WinError 32（文件被占用）——
-        # 那不是测试失败，只是清理时机太早。
+        # 不睡这一下，临时目录清理会报 WinError 32（文件被占用）。
         time.sleep(0.5)
     return {"readySeconds": ready_at, "health": body,
             "exitCode": proc.returncode, "output": output}

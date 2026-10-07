@@ -199,6 +199,49 @@ def test_real_drill_shape() -> list:
     ]
 
 
+def test_sub_threshold_serial_tasks_merge() -> list:
+    """**已知局限**：间隔小于容差的首尾相接任务会被并进同一层。
+
+    这不是「期望行为」，而是把当前取舍钉住，免得以后有人当 bug 改掉又没改对。
+
+    为什么不做更聪明的推断：**仅凭时间戳区分不了**这两种情况 ——
+      (a) 同层任务因起子进程有先后（观测：启动差几十毫秒）
+      (b) 不同层但前一层极短（观测：启动差几十毫秒）
+    两种情况的观测量**完全一样**。既然区分不了，就选一个并在文档里写清楚，
+    而不是假装能算准。
+
+    后果：这类 trace 的「理论最短」偏小、「编排开销」也随之偏小。
+    对普通场景（层间隔是秒级）没有影响。
+    """
+    print("\n[已知局限] 间隔 40ms 的串行任务会被并进同一层")
+    gap = LAYER_START_TOLERANCE_MS - 10          # 40ms，小于容差
+    r = analyze([task("a", 0, 1000), task("b", gap, 1000)])
+    return [
+        check(f"间隔 {gap:.0f}ms < 容差 {LAYER_START_TOLERANCE_MS:.0f}ms → 判成 1 层",
+              len(r["layers"]) == 1, f"实际 {len(r['layers'])} 层"),
+        # 真实是两层串行（理论最短应 2000），被并层后只算 1000 —— 偏小
+        check("理论最短因此偏小（1000 而非 2000）",
+              approx(r["theoreticalMs"], 1000, 1),
+              f"实际 {r['theoreticalMs']:.0f}"),
+        check("峰值仍是 2（区间确实重叠，这部分没算错）",
+              r["peakParallelism"] == 2),
+    ]
+
+
+def test_over_threshold_stays_separate() -> list:
+    """对照：间隔超过容差就必须分层，否则这条启发式就没意义了。"""
+    print("\n[对照] 间隔超过容差 → 正确分层")
+    gap = LAYER_START_TOLERANCE_MS + 20          # 70ms，大于容差
+    r = analyze([task("a", 0, 1000), task("b", gap, 1000)])
+    return [
+        check(f"间隔 {gap:.0f}ms > 容差 → 分出 2 层",
+              len(r["layers"]) == 2, f"实际 {len(r['layers'])} 层"),
+        check("理论最短 = 2000（两层各自最慢之和）",
+              approx(r["theoreticalMs"], 2000, 1),
+              f"实际 {r['theoreticalMs']:.0f}"),
+    ]
+
+
 CASES = [
     ("空输入", test_empty),
     ("单任务", test_single),
@@ -210,6 +253,8 @@ CASES = [
     ("排除占位任务", test_placeholders_excluded),
     ("利用率时间线", test_buckets),
     ("实测形状", test_real_drill_shape),
+    ("已知局限：亚阈值并层", test_sub_threshold_serial_tasks_merge),
+    ("对照：超阈值正常分层", test_over_threshold_stays_separate),
 ]
 
 

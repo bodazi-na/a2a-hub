@@ -109,6 +109,36 @@ curl -X POST http://127.0.0.1:9200/ -H "Content-Type: application/json" \
 - 都不是：照着 [`docs/architecture.md` 的「写 CLI 适配器必踩的坑」](docs/architecture.md#写-cli-适配器必踩的坑全部实测过)
   和 `examples/mock_agent.py` 自己写一层
 
+### 怎么停
+
+**正常方式：在跑 `serve` 的那个窗口按 `Ctrl-C`。** 用启动器起的话，直接关掉那个窗口
+即可（服务就跑在里面）。
+
+hub **不是常驻服务**（没有注册成系统服务、没有开机自启），所以停掉它不需要任何
+额外步骤 —— 窗口一关就没了。
+
+**找不到那个窗口时**（比如它是后台起的）：
+
+```bash
+# 先看谁占着端口
+netstat -ano | findstr :9200
+# 再按 PID 停
+taskkill /PID <上面那个PID> /F
+```
+
+**停掉之后会怎样**（实测过）：
+
+| 项 | 行为 |
+| --- | --- |
+| 已落库的数据 | **不丢**。SQLite 文件在 `data/hub.db`，重启后任务、历史、产物都还在 |
+| 正在跑的下游子进程 | **会被一起收走，不留孤儿**。适配器把子进程收进了 Job Object 并设了 `KILL_ON_JOB_CLOSE` —— hub 一死，job 句柄关闭，整棵进程树由系统回收（包括 `cmd.exe` 外壳和它底下的执行体） |
+| 正在跑的任务 | 状态停在 `working`，**下次启动时自动结算成 `failed`**，原因写明 `interrupted` |
+| 下游的副作用 | **可能已经发生了**。任务被中断不代表它什么都没干 —— 文件可能已经写进 `workspace/`。错误文案里明确提示**先验盘再重跑**，不要只凭 `ok=false` 就认为可以安全重来 |
+
+> 实测：派一个长任务 → 在 `WORKING` 状态强杀 hub → 子进程数**回到基线**（无孤儿）；
+> 重启后该任务状态为 `TASK_STATE_FAILED`，原因是
+> 「interrupted: hub 在任务执行期间重启……重跑前请先检查 workspace」。
+
 ## 任务模型
 
 | 模式 | 用法 | 适用场景 |

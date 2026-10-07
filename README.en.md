@@ -123,6 +123,37 @@ The demo downstream only exists to show it working. To connect real tools:
   [`docs/architecture.md`](docs/architecture.md) (that file is in Chinese) and
   `examples/mock_agent.py`
 
+### How to stop it
+
+**The normal way: press `Ctrl-C` in the window running `serve`.** If you started it with
+the launcher, just close that window (the server runs inside it).
+
+hub is **not a resident service** — it is not registered as a system service and does
+not auto-start, so stopping it needs no extra steps: closing the window is enough.
+
+**If you cannot find that window** (for example it was started in the background):
+
+```bash
+# see who holds the port
+netstat -ano | findstr :9200
+# then stop it by PID
+taskkill /PID <the-PID-above> /F
+```
+
+**What happens after you stop it** (measured):
+
+| Item | Behaviour |
+| --- | --- |
+| Data already persisted | **Not lost.** The SQLite file lives at `data/hub.db`; after a restart the tasks, history and artifacts are all still there |
+| Running downstream child processes | **Cleaned up together, no orphans.** The adapter puts children into a Job Object with `KILL_ON_JOB_CLOSE` — once hub dies, the job handle closes and the OS reclaims the whole process tree (including the `cmd.exe` shell and whatever it launched) |
+| A task that was running | Its state stays `working`, and **the next startup settles it to `failed`** with the reason `interrupted` |
+| Downstream side effects | **May already have happened.** An interrupted task does not mean it did nothing — files may already have been written into `workspace/`. The error text explicitly says to **check the workspace before re-running**, rather than trusting `ok=false` as "safe to retry" |
+
+> Measured: dispatched a long task → hard-killed hub while it was `WORKING` → child
+> process count **returned to baseline** (no orphans); after restart the task was
+> `TASK_STATE_FAILED` with the reason "interrupted: hub restarted while this task was
+> active… check the workspace before re-running".
+
 ## Task model
 
 | Mode | Usage | Fits |

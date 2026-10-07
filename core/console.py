@@ -127,6 +127,23 @@ CONSOLE_HTML = r"""<!DOCTYPE html>
     background: var(--ok); margin-right: 6px; animation: pulse 1.4s infinite;
   }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+
+  /* ---- 并行度 ---- */
+  .par-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+              gap: 8px; margin: 10px 0 4px; }
+  .par-card { background: var(--panel2); border: 1px solid var(--line);
+              border-radius: 6px; padding: 9px 11px; }
+  .par-card .v { font-size: 19px; font-family: var(--mono); line-height: 1.2; }
+  .par-card .k { font-size: 11px; color: var(--fg3); margin-top: 3px; }
+  .par-card .h { font-size: 11px; color: var(--fg3); margin-top: 4px; line-height: 1.35; }
+  .util { display: flex; align-items: flex-end; gap: 1px; height: 54px;
+          border-bottom: 1px solid var(--line); margin: 8px 0 3px; }
+  .util i { flex: 1; background: var(--accent); min-height: 1px;
+            border-radius: 1px 1px 0 0; opacity: .85; }
+  .util i.zero { background: var(--line); opacity: 1; }
+  .util-x { display: flex; justify-content: space-between;
+            font-size: 11px; color: var(--fg3); font-family: var(--mono); }
+  .note { font-size: 12px; color: var(--fg3); line-height: 1.5; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -263,6 +280,78 @@ function renderTasks() {
   });
 }
 
+function renderParallelism(p) {
+  if (!p || !p.tasks) {
+    return `<h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:20px 0 6px">并行度</h2>
+      <div class="note">这条 trace 里没有真正跑过的任务（可能全是还没派活的占位 step），
+      无法分析并行度。</div>`;
+  }
+
+  // 六个指标卡。每个都带一句「怎么读」—— 单独一个「2.1×」没有意义，
+  // 读者需要知道分母是什么。
+  const cards = [
+    { v: p.avgParallelism + "×", k: "平均并行度",
+      h: "串行总时长 ÷ 墙钟。1.0 = 完全串行" },
+    { v: p.peakParallelism + " 路", k: "峰值并行度",
+      h: "最多时几个 agent 同时在跑" },
+    { v: Math.round(p.idleRatio * 100) + "%", k: "空闲率",
+      h: "墙钟里一个 agent 都没在跑的时间占比" },
+    { v: Math.round(p.overheadRatio * 100) + "%", k: "编排开销",
+      h: "墙钟比「理论最短」多出来的部分" },
+    { v: ms(p.wallMs), k: "墙钟", h: "第一个开始 → 最后一个结束" },
+    { v: ms(p.serialMs), k: "串行总时长", h: "各任务时长直接相加" },
+  ].map(c => `<div class="par-card">
+      <div class="v">${esc(c.v)}</div>
+      <div class="k">${esc(c.k)}</div>
+      <div class="h">${esc(c.h)}</div>
+    </div>`).join("");
+
+  const peak = Math.max(1, ...p.buckets.map(b => b.active));
+  const bars = p.buckets.map(b => {
+    // 0 也画一条极细的底线 —— 完全留白的话，看不出「这里真的没人干活」
+    const h = b.active ? Math.max(8, Math.round(b.active / peak * 100)) : 3;
+    return `<i class="${b.active ? "" : "zero"}" style="height:${h}%"
+               title="${b.at}ms：${b.active} 个 agent 在跑"></i>`;
+  }).join("");
+
+  const layers = (p.layers || []).map(L => `
+    <tr>
+      <td class="mono">层 ${L.index}</td>
+      <td>${L.tasks}</td>
+      <td class="mono">${ms(L.wallMs)}</td>
+      <td class="mono">${ms(L.slowestMs)}</td>
+      <td class="mono">${L.speedup}×</td>
+      <td class="mono" style="color:${L.efficiency > 0.9 ? "var(--ok)"
+          : L.efficiency > 0.6 ? "var(--warn)" : "var(--bad)"}">${L.efficiency}</td>
+      <td class="dim">${L.steps.map(s => esc(s.stepId || "?")).join(" · ")}</td>
+    </tr>`).join("");
+
+  return `
+    <h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:20px 0 6px">并行度</h2>
+    <div class="par-grid">${cards}</div>
+
+    <div style="font-size:12px;color:var(--fg3);margin:14px 0 0">
+      利用率时间线 —— 每个时间片有几个 agent 在跑（越高越并行，贴底线 = 没人干活）
+    </div>
+    <div class="util">${bars}</div>
+    <div class="util-x"><span>0</span><span>${ms(p.wallMs)}</span></div>
+
+    <table class="tl" style="margin-top:16px">
+      <thead><tr><th>层</th><th>任务</th><th>墙钟</th><th>最慢那个</th>
+        <th>加速</th><th>效率</th><th>step</th></tr></thead>
+      <tbody>${layers}</tbody>
+    </table>
+
+    <div class="note">
+      <b>分层是「按观测推断」的</b>：编排器派发同一层时是一起起子进程的，
+      所以把<b>启动时刻相近</b>（50ms 内）的任务算作一层。
+      理论最短 = 各层「最慢那个」之和 —— 这是分层的下界，不是严格关键路径
+      （那需要计划里的依赖图，而它没有落库）。<br>
+      所以：<b>平均并行度</b>看并行有没有生效，<b>空闲率</b>看调度有没有在等，
+      <b>编排开销</b>看还能不能更快。
+    </div>`;
+}
+
 function renderTraceDetail() {
   const d = state.trace;
   if (!d) { $("#trace-detail").innerHTML = ""; return; }
@@ -300,6 +389,8 @@ function renderTraceDetail() {
     </tr>`).join("");
 
   $("#trace-detail").innerHTML = head
+    + renderParallelism(d.parallelism)
+    + `<h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:20px 0 6px">甘特图</h2>`
     + `<div class="gantt">${gantt}</div>`
     + `<h2 style="font-size:13px;font-weight:400;color:var(--fg2);margin:18px 0 6px">过程时间线</h2>`
     + `<div class="dim" style="margin-bottom:6px;font-size:12px">`

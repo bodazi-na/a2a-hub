@@ -51,6 +51,7 @@ from starlette.routing import Route
 
 from adapters.base import Adapter
 from core.orchestrator import Orchestrator, PlanError
+from core.parallelism import analyze
 from core.registry import Registry
 from core.router import NoRouteError, Router
 from core.store import Store, new_id
@@ -1396,6 +1397,11 @@ class Hub:
                 }
                 for m in messages
             ],
+            # 并行度分析。**传原始行而不是上面那份 payload**：上面的
+            # `_task_started_at` 会把没开始的任务回退到 created_at，
+            # 而并行度必须把「从未派活」的任务排除掉（它们不占时间，
+            # 算进来会凭空多出一段并行，指标就废了）。
+            "parallelism": analyze(tasks),
         }
 
     async def _list_traces(self, params: dict[str, Any]) -> dict[str, Any]:

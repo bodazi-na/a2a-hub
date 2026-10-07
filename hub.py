@@ -23,8 +23,26 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
+def _base_dir() -> Path:
+    """运行时数据（`data/` `workspace/` `agents/`）的根目录。
+
+    **冻结后不能用 `__file__`**：PyInstaller 会把代码放进打包内部目录，
+    而 onefile 模式下那是个临时目录、**退出即删**。数据库放那里等于每次
+    重启都从零开始，而且退出时**静默**丢失 —— 不会有任何报错。
+
+    所以冻结时用 exe 自己所在的目录。这也正好是「绿色免安装」该有的语义：
+    exe 拷到哪，数据就跟到哪。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = _base_dir()
+# 源码运行时，仓库根要在 sys.path 上（core / adapters 是顶层包）。
+# 冻结后代码已在包内，不需要 —— 而且此时把 exe 目录塞进去反而有风险：
+# 用户目录里若恰好有个同名 `core/`，会遮蔽打包内的实现。
+if not getattr(sys, "frozen", False) and str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from adapters.a2a_http import A2AHttpAdapter      # noqa: E402
@@ -34,6 +52,29 @@ from core.router import Router                     # noqa: E402
 from core.store import Store                       # noqa: E402
 
 DEFAULT_DB = ROOT / "data" / "hub.db"
+
+
+def _force_utf8_output() -> None:
+    """把 stdout / stderr 固定成 UTF-8。
+
+    为什么必须显式做：Python 在 Windows 上**重定向**输出时用系统代码页
+    （中文 Windows 是 GBK），于是日志里的中文变乱码。实测冻结成 exe 后
+    `(来自 Agent Card)` 输出成 `(\\xc0\\xb4\\xd7\\xd4 Agent Card)`。
+
+    源码运行时通常踩不到 —— 因为开发环境一般设了 `PYTHONUTF8=1` /
+    `PYTHONIOENCODING`，而**冻结后的 exe 不认这两个变量**。所以
+    「我这儿跑着好好的」不能说明用户双击时也正常。
+
+    固定成 UTF-8 而不是跟随系统代码页：这台工具的 HTTP / JSON 本来就是
+    UTF-8，日志跟它们保持一致比跟随一个历史代码页更有用。接真实控制台时
+    Windows 走的是 `WriteConsoleW`，本来就按 Unicode 处理，不受影响。
+    `errors="replace"` 保证遇到不可编码字符时也不会抛异常把 CLI 弄挂。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass          # 被重定向到不支持 reconfigure 的对象，跳过即可
 
 
 def build_hub(db_path: Path, *, auth_token: str | None = None) -> Hub:
@@ -155,6 +196,11 @@ def cmd_probe(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # 在**任何输出之前**固定编码 —— 见 _force_utf8_output 的说明。
+    # 放在 main 而不是模块顶层：这样 hub.py 被当库 import 时不会去动
+    # 调用方的 stdout。
+    _force_utf8_output()
+
     ap = argparse.ArgumentParser(prog="hub")
     ap.add_argument("--db", default=str(DEFAULT_DB), help="SQLite 路径")
     sub = ap.add_subparsers(dest="cmd", required=True)

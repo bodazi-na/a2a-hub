@@ -23,6 +23,32 @@
 
 ### 新增
 
+**打包成 exe（Windows，免安装）**
+
+- `packaging/hub.spec` + `tools/build_exe.py`：一条命令打成免安装 exe。
+  **构建脚本会自动实测启动**并打一次 `/healthz` —— 构建成功不等于能跑
+- 目录版与单文件版都支持（`--onefile` / `--both`）
+
+过程中修掉三个坑（都会写进代码注释）：
+
+| 坑 | 症状 | 修法 |
+| --- | --- | --- |
+| 冻结后 `__file__` 指向打包内部 | **onefile 下数据落在临时目录、退出即删**，每次重启从零开始且**静默**丢失 | `sys.frozen` 时改用 exe 所在目录 |
+| 冻结后的 exe 不认 `PYTHONUTF8` / `PYTHONIOENCODING` | 开发机正常，用户双击时中文乱码（`(来自 Agent Card)` → `(\xc0\xb4\xd7\xd4 …)`） | `hub.py` 显式把 stdout/stderr 固定成 UTF-8 |
+| 两种形态共用一个 workpath | 先建目录版再建单文件版，会复用陈旧中间产物，产出**能构建成功但一跑就报 `Could not create temporary directory!`** 的坏 bundle | 各用各的 workpath |
+
+**并行度分析**
+
+- `core/parallelism.py`：从任务的起止时间算**平均/峰值并行度、空闲率、
+  编排开销、利用率时间线**，以及按观测分层的理论最短。纯函数、零依赖，
+  可在单元级穷举边界
+- trace 接口新增 `parallelism` 块；控制台 Trace 详情里出指标卡 +
+  利用率时间线 + 分层表
+- **口径写在返回值里**（`layerSource: "observed"`）：分层是从**实际启动时刻**
+  聚类推出来的（编排器派发同层是一起起子进程的，实测差 3.5 毫秒），
+  理论最短 = 各层「最慢那个」之和。**这是分层的下界，不是严格关键路径** ——
+  严格关键路径需要计划里的依赖图，而它没有落库
+
 **实时流**
 
 - `SendStreamingMessage`（含 `message/stream` 别名）：A2A 标准的 SSE 流式。

@@ -507,22 +507,33 @@ detail gives you these numbers:
 | **Orchestration overhead** | How much the wall clock exceeds the "theoretical minimum" — **this is the answer to "can it go faster"** |
 | Utilisation timeline | How many agents were working in each time slice; hugging the baseline = nobody working |
 
-**Layering is inferred from observation**; either condition starts a new layer:
+**Layering is inferred from observation**, with a single criterion:
 
-1. **Start times more than 50 ms apart** — the orchestrator spawns every task of a
-   layer together (measured: three parallel tasks 3.5 ms apart), while the next layer
-   only starts after the previous one has fully finished, usually seconds later
-2. **A start time not earlier than the current layer's latest end** — i.e. "the
-   previous batch has fully finished, so this one begins". That is the *definition* of
-   strict layering, and more reliable than any threshold
+> **The batch that starts only after the previous batch has fully finished is a new
+> layer.**
 
-> Condition 2 was **added after hitting it in practice**: with only condition 1, a
-> layer that completes **faster than 50 ms** gets merged into the next one — the demo
-> downstream (mock) finishes a whole layer in a few milliseconds, so a plan that is
-> genuinely 2 layers was reported as 1 and the "theoretical minimum" came out wrong.
-> And that is the most common kind of downstream (a local echo, a short script).
+That is the *definition* of strict layering (the orchestrator makes layer N+1 wait for
+layer N to finish completely), so it depends on no empirical threshold.
+
+> This was **settled only after getting it wrong twice**. The first version used "start
+> times more than 50 ms apart", and it failed in both directions:
+>
+> - Threshold too large relative to the layer: the demo downstream (mock) finishes a
+>   whole layer in milliseconds → **a 2-layer plan was reported as 1 layer**
+> - Threshold too small relative to dispatch spacing: the HTTP adapter dispatches the
+>   three tasks of one layer ~45 ms apart, so the third is 89 ms from the layer start →
+>   **three genuinely overlapping parallel tasks were split into 2 + 1 layers**
+>
+> The shift in perspective: **"how far apart are the start times" is simply the wrong
+> question**. "Do the intervals overlap" is the right one. **Two tasks whose time
+> intervals overlap are in the same layer, by definition.**
 
 The theoretical minimum is the sum of each layer's "slowest task".
+
+**The one cost**: if tasks in a layer get serialised by the concurrency cap (one starts
+only after the previous finishes), they are reported as separate layers. But that is
+the truth — at that moment they really were not running in parallel, and the metric
+should say so.
 
 > **This is a lower bound for the layering, not a strict critical path** — a strict
 > critical path needs the dependency graph from the plan, which is not persisted. So

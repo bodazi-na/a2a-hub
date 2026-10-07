@@ -35,17 +35,19 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-# 判定「同一层」的启动时刻容差（毫秒）。
+# 层边界的时钟抖动容差（毫秒）。
 #
-# 为什么按**启动时刻聚类**而不是按「上一批结束」：
-# 严格分层下，第 N+1 层恰好是「第 N 层全部结束的那一刻」开始 —— 用
-# `start > 上一层结束` 判定会因为边界取等而把两层并成一层（实测踩到：
-# 串行的两个任务被判成同一层）。而编排器派发同一层时是**同时**起子进程的，
-# 实测三路并行的 startedAt 只差 3.5 毫秒。
+# 判据是「启动时刻不早于当前层的最晚结束时刻」。严格分层下这两者**恰好相等**
+# （上一层结束的同一刻，下一层开始），所以留一点点余量吸收时间戳抖动。
 #
-# 所以「启动时刻接近 ⇒ 同一层」是更贴合实际执行模型的判据。
-# 50ms 是给子进程冷启动留的余量（杀软扫描、cmd.exe 拉起）。
-LAYER_START_TOLERANCE_MS = 50.0
+# **必须很小**：它会被拿去和任务的**时长**比较。设成 5ms 时，一个只跑 5ms 的
+# 任务会被自己层里的下一个任务判成新层（`cur_end - 5` 正好等于它的启动时刻）——
+# 实测把「整层 5ms 的 2 层 plan」判成了 4 层。
+#
+# 1ms 够用：`utcnow()` 是**微秒**精度（`isoformat(timespec="microseconds")`），
+# 抖动本来就在亚毫秒量级，而编排器让下一层等上一层全部结束才起，
+# 正常情况下 `start` 只会**晚于** `end`，根本用不到这个容差。
+LAYER_BOUNDARY_EPSILON_MS = 1.0
 
 # 利用率时间线的默认桶数。太多看不清趋势，太少看不出毛刺。
 DEFAULT_BUCKETS = 60
@@ -120,42 +122,37 @@ def _sweep(spans: list[tuple[float, float, dict]]) -> dict[str, float]:
 
 
 def _infer_layers(spans: list[tuple[float, float, dict]]) -> list[list[tuple[float, float, dict]]]:
-    """切层：同时派发的算一层。
+    """切层：**上一批全部跑完之后才开始的那一批，算新的一层。**
 
-    两条判据，**满足任一条就开新层**：
+    判据只有一条：`start >= 当前层的最晚结束时刻 - 抖动容差`。
 
-    1. **启动时刻相差超过容差** —— 编排器派发同一层时是一起起子进程的，
-       实测三路并行只差 3.5 毫秒；下一层要等上一层全部结束才起，间隔通常是秒级。
-       两者差着好几个数量级。
-    2. **启动时刻不早于当前层的最晚结束时刻** —— 也就是「上一批已经全部跑完，
-       这才开始」。这是严格分层的**定义**，比阈值更硬。
+    为什么是这条而不是「启动时刻相差多少」：
 
-    为什么必须有第 2 条：只有第 1 条时，**整层跑得比容差还快**就会被并进下一层。
-    实测踩到 —— 演示下游（mock）整层几毫秒就跑完，一个本该 2 层的 plan 被判成
-    1 层，「理论最短」跟着算错。这类下游恰恰是最常见的（本地 echo、短脚本）。
+    - 这是严格分层的**定义** —— 编排器让第 N+1 层等第 N 层全部结束才起。
+      用定义判定，不依赖任何经验阈值。
+    - **「启动时刻相差 X 毫秒」是错的方向**。实测踩过两次：
+      先是拿 50ms 当阈值，结果**整层比 50ms 还快**时判据完全失效（演示下游
+      mock 整层几毫秒跑完，2 层的 plan 被判成 1 层）；把阈值调小之后又发现
+      **HTTP 适配器派发同一层的三个任务间隔约 45ms**，第三路离层首已经 89ms，
+      于是真重叠的三路并行被拆成 2+1 层。
+    - 换个角度想就清楚了：**两个时间区间重叠的任务，本来就是同一层**。
+      「启动时刻差多少」根本不是这件事的判据。
 
-    第 2 条不会破坏「同层但启动有先后」：那种情况下层里总还有任务在跑，
-    `cur_end` 是**运行中的最大结束时刻**，后启动的那个通常早于它。
+    唯一的代价：如果同一层里的任务因为并发上限被**串行化**（前一个跑完才开始
+    下一个），它们会被判成不同层。但那恰恰是事实 —— 那一刻它们确实没在并行，
+    指标就该如实反映。
     """
     ordered = sorted(spans, key=lambda s: (s[0], s[1]))
     layers: list[list[tuple[float, float, dict]]] = []
     cur: list[tuple[float, float, dict]] = []
-    cur_start: float | None = None
     cur_end: float | None = None
 
     for span in ordered:
-        starts_new = bool(cur) and cur_start is not None and cur_end is not None and (
-            span[0] - cur_start > LAYER_START_TOLERANCE_MS   # 判据 1：离层首够远
-            or span[0] >= cur_end                            # 判据 2：上一层已跑完
-        )
-        if starts_new:
+        if cur and cur_end is not None and span[0] >= cur_end - LAYER_BOUNDARY_EPSILON_MS:
             layers.append(cur)
             cur = []
-            cur_start = None
             cur_end = None
         cur.append(span)
-        if cur_start is None:
-            cur_start = span[0]
         cur_end = span[1] if cur_end is None else max(cur_end, span[1])
     if cur:
         layers.append(cur)

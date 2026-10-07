@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.parallelism import (                                    # noqa: E402
-    LAYER_START_TOLERANCE_MS,
+    LAYER_BOUNDARY_EPSILON_MS,
     analyze,
 )
 
@@ -132,10 +132,10 @@ def test_layered() -> list:
 
 def test_same_layer_jitter() -> list:
     """同层任务因起子进程有先后，启动时刻差几十毫秒 —— 不能被拆成两层。"""
-    print("\n[容差] 同层启动差 30ms（< 容差）应仍算一层")
+    print("\n[同层] 启动差 30ms 但区间重叠 → 仍算一层")
     r = analyze([task("a", 0, 1000), task("b", 30, 1000)])
     return [
-        check(f"仍是一层（容差 {LAYER_START_TOLERANCE_MS:.0f}ms）",
+        check("仍是一层（区间重叠了 970ms）",
               len(r["layers"]) == 1, f"实际 {len(r['layers'])} 层"),
         check("峰值 = 2（确实重叠）", r["peakParallelism"] == 2),
     ]
@@ -199,65 +199,77 @@ def test_real_drill_shape() -> list:
     ]
 
 
-def test_sub_threshold_serial_tasks_merge() -> list:
-    """**已知局限**：间隔小于容差的首尾相接任务会被并进同一层。
+def test_overlapping_tasks_are_one_layer() -> list:
+    """**时间区间重叠的两个任务，本来就是同一层** —— 无论启动时刻差多少。
 
-    这不是「期望行为」，而是把当前取舍钉住，免得以后有人当 bug 改掉又没改对。
+    这条是踩过两次才定下来的。早先用「启动时刻相差 > 50ms 就分层」，两个方向
+    都错过：
 
-    为什么不做更聪明的推断：**仅凭时间戳区分不了**这两种情况 ——
-      (a) 同层任务因起子进程有先后（观测：启动差几十毫秒）
-      (b) 不同层但前一层极短（观测：启动差几十毫秒）
-    两种情况的观测量**完全一样**。既然区分不了，就选一个并在文档里写清楚，
-    而不是假装能算准。
+    - 阈值相对层太长：演示下游整层几毫秒跑完，2 层的 plan 被判成 1 层
+    - 阈值相对派发间隔太短：HTTP 适配器派发同一层的三个任务间隔约 45ms，
+      第三路离层首已 89ms，**真重叠的三路并行被拆成 2+1 层**
 
-    后果：这类 trace 的「理论最短」偏小、「编排开销」也随之偏小。
-    对普通场景（层间隔是秒级）没有影响。
+    换个角度就清楚了：**「启动时刻差多少」根本不是这件事的判据**，
+    「区间有没有重叠」才是。现在用严格分层的定义判定：上一批全部跑完才开始 ⇒ 新层。
     """
-    print("\n[已知局限] 间隔 40ms 的串行任务会被并进同一层")
-    gap = LAYER_START_TOLERANCE_MS - 10          # 40ms，小于容差
-    r = analyze([task("a", 0, 1000), task("b", gap, 1000)])
+    print("\n[重叠] 启动差 70ms 但区间重叠 → 同一层")
+    r = analyze([task("a", 0, 1000), task("b", 70, 1000)])
     return [
-        check(f"间隔 {gap:.0f}ms < 容差 {LAYER_START_TOLERANCE_MS:.0f}ms → 判成 1 层",
+        check("判成 1 层（两者重叠了 930ms）",
               len(r["layers"]) == 1, f"实际 {len(r['layers'])} 层"),
-        # 真实是两层串行（理论最短应 2000），被并层后只算 1000 —— 偏小
-        check("理论最短因此偏小（1000 而非 2000）",
+        check("峰值 = 2", r["peakParallelism"] == 2),
+        check("理论最短 = 1000（取最慢那个，不是求和）",
               approx(r["theoreticalMs"], 1000, 1),
               f"实际 {r['theoreticalMs']:.0f}"),
-        check("峰值仍是 2（区间确实重叠，这部分没算错）",
-              r["peakParallelism"] == 2),
     ]
 
 
-def test_over_threshold_stays_separate() -> list:
-    """对照：间隔超过容差就必须分层，否则这条启发式就没意义了。"""
-    print("\n[对照] 间隔超过容差 → 正确分层")
-    gap = LAYER_START_TOLERANCE_MS + 20          # 70ms，大于容差
-    r = analyze([task("a", 0, 1000), task("b", gap, 1000)])
+def test_boundary_equality_splits() -> list:
+    """**首尾相接（边界取等）必须分成两层** —— 这里最容易写错。
+
+    「上一层结束的同一刻，下一层开始」在严格分层下是**精确成立**的，
+    所以判据里不能写 `start > 上一层结束` —— 取等就把两层并成一层了。
+    """
+    print("\n[边界] 首尾相接（b 恰好在 a 结束那刻开始）→ 2 层")
+    r = analyze([task("a", 0, 1000), task("b", 1000, 1000)])
     return [
-        check(f"间隔 {gap:.0f}ms > 容差 → 分出 2 层",
+        check("分出 2 层", len(r["layers"]) == 2, f"实际 {len(r['layers'])} 层"),
+        check("理论最短 = 2000", approx(r["theoreticalMs"], 2000, 1)),
+        check("空闲率 = 0（首尾相接，没有空档）",
+              approx(r["idleRatio"], 0.0, 0.001), f"实际 {r['idleRatio']}"),
+    ]
+
+
+def test_jitter_at_boundary_still_splits() -> list:
+    """边界处有亚毫秒抖动（下一层「提前」了一点点）仍要能分层。
+
+    正常情况下编排器让下一层等上一层**全部结束**才起，所以 `start` 只会晚于
+    `end`，用不到这个容差。留它是防御性的 —— 但**必须很小**：容差会被拿去和
+    任务时长比较，设成 5ms 时一个只跑 5ms 的任务会被自己层里的下一个判成新层。
+    """
+    print("\n[抖动] 下一层比上一层结束早 0.5ms → 仍要分出 2 层")
+    r = analyze([task("a", 0, 1000), task("b", 999.5, 1000)])
+    return [
+        check("分出 2 层（容差吸收了 0.5ms 抖动）",
               len(r["layers"]) == 2, f"实际 {len(r['layers'])} 层"),
-        check("理论最短 = 2000（两层各自最慢之和）",
-              approx(r["theoreticalMs"], 2000, 1),
-              f"实际 {r['theoreticalMs']:.0f}"),
     ]
 
 
 def test_fast_layers_still_split() -> list:
-    """**整层比容差还快时，仍必须正确分层。**
+    """**整层只有几毫秒时，仍必须正确分层。**
 
-    实测踩到的真实场景：演示下游（mock）整层几毫秒就跑完，于是「启动时刻相差
-    50ms」这条判据完全失效 —— 一个本该 2 层的 plan 被判成 1 层，「理论最短」
-    跟着算错。而这恰恰是最常见的下游类型（本地 echo、短脚本）。
+    实测踩到的真实场景：演示下游（mock）整层几毫秒就跑完。这曾经把 2 层的 plan
+    判成 1 层 —— 因为当时的判据是「启动时刻相差 > 50ms」，整层比容差还快时它
+    完全失效。现在改用「上一批全部跑完才开始」这条定义，与层有多短无关。
 
-    修法是加一条更硬的判据：**启动时刻不早于当前层的最晚结束时刻** ⇒ 新层。
-    那是严格分层的定义，比阈值可靠。
+    这条同时钉住另一件事：**容差不能被拿去和任务时长比较**。容差设成 5ms 时，
+    一个只跑 5ms 的任务会被自己层里的下一个判成新层（实测判成 4 层）。
     """
     print("\n[快下游] 整层 5ms 跑完，仍要分出 2 层")
     r = analyze([task("a", 0, 5), task("b", 0, 5), task("c", 0, 5),
                  task("merge", 5, 3)])
     return [
-        check("分出 2 层（阈值判据在此完全失效）",
-              len(r["layers"]) == 2, f"实际 {len(r['layers'])} 层"),
+        check("分出 2 层", len(r["layers"]) == 2, f"实际 {len(r['layers'])} 层"),
         check("层0 = 3 路并行", r["layers"][0]["tasks"] == 3),
         check("层1 = 汇总", r["layers"][1]["tasks"] == 1),
         check("理论最短 = 5 + 3 = 8ms",
@@ -278,8 +290,9 @@ CASES = [
     ("排除占位任务", test_placeholders_excluded),
     ("利用率时间线", test_buckets),
     ("实测形状", test_real_drill_shape),
-    ("已知局限：亚阈值并层", test_sub_threshold_serial_tasks_merge),
-    ("对照：超阈值正常分层", test_over_threshold_stays_separate),
+    ("重叠即同层", test_overlapping_tasks_are_one_layer),
+    ("边界取等要分层", test_boundary_equality_splits),
+    ("边界抖动仍分层", test_jitter_at_boundary_still_splits),
     ("快下游仍正确分层", test_fast_layers_still_split),
 ]
 

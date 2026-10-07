@@ -120,25 +120,43 @@ def _sweep(spans: list[tuple[float, float, dict]]) -> dict[str, float]:
 
 
 def _infer_layers(spans: list[tuple[float, float, dict]]) -> list[list[tuple[float, float, dict]]]:
-    """按**启动时刻聚类**切层：同时派发的算一层。
+    """切层：同时派发的算一层。
 
-    编排器派发同一层时是一起起子进程的，所以同层任务的 startedAt 相差极小
-    （实测三路并行差 3.5 毫秒）。下一层要等上一层全部结束才起，间隔通常
-    是秒级。两者差着好几个数量级，用 50ms 的容差区分是稳的。
+    两条判据，**满足任一条就开新层**：
+
+    1. **启动时刻相差超过容差** —— 编排器派发同一层时是一起起子进程的，
+       实测三路并行只差 3.5 毫秒；下一层要等上一层全部结束才起，间隔通常是秒级。
+       两者差着好几个数量级。
+    2. **启动时刻不早于当前层的最晚结束时刻** —— 也就是「上一批已经全部跑完，
+       这才开始」。这是严格分层的**定义**，比阈值更硬。
+
+    为什么必须有第 2 条：只有第 1 条时，**整层跑得比容差还快**就会被并进下一层。
+    实测踩到 —— 演示下游（mock）整层几毫秒就跑完，一个本该 2 层的 plan 被判成
+    1 层，「理论最短」跟着算错。这类下游恰恰是最常见的（本地 echo、短脚本）。
+
+    第 2 条不会破坏「同层但启动有先后」：那种情况下层里总还有任务在跑，
+    `cur_end` 是**运行中的最大结束时刻**，后启动的那个通常早于它。
     """
     ordered = sorted(spans, key=lambda s: (s[0], s[1]))
     layers: list[list[tuple[float, float, dict]]] = []
     cur: list[tuple[float, float, dict]] = []
     cur_start: float | None = None
+    cur_end: float | None = None
 
     for span in ordered:
-        if cur and cur_start is not None and span[0] - cur_start > LAYER_START_TOLERANCE_MS:
+        starts_new = bool(cur) and cur_start is not None and cur_end is not None and (
+            span[0] - cur_start > LAYER_START_TOLERANCE_MS   # 判据 1：离层首够远
+            or span[0] >= cur_end                            # 判据 2：上一层已跑完
+        )
+        if starts_new:
             layers.append(cur)
             cur = []
             cur_start = None
+            cur_end = None
         cur.append(span)
         if cur_start is None:
             cur_start = span[0]
+        cur_end = span[1] if cur_end is None else max(cur_end, span[1])
     if cur:
         layers.append(cur)
     return layers

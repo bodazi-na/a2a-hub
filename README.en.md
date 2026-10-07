@@ -507,9 +507,22 @@ detail gives you these numbers:
 | **Orchestration overhead** | How much the wall clock exceeds the "theoretical minimum" — **this is the answer to "can it go faster"** |
 | Utilisation timeline | How many agents were working in each time slice; hugging the baseline = nobody working |
 
-**Layering is inferred from observation**: the orchestrator spawns every task of a
-layer together, so tasks with **close start times** (within 50 ms) are treated as one
-layer. The theoretical minimum is the sum of each layer's "slowest task".
+**Layering is inferred from observation**; either condition starts a new layer:
+
+1. **Start times more than 50 ms apart** — the orchestrator spawns every task of a
+   layer together (measured: three parallel tasks 3.5 ms apart), while the next layer
+   only starts after the previous one has fully finished, usually seconds later
+2. **A start time not earlier than the current layer's latest end** — i.e. "the
+   previous batch has fully finished, so this one begins". That is the *definition* of
+   strict layering, and more reliable than any threshold
+
+> Condition 2 was **added after hitting it in practice**: with only condition 1, a
+> layer that completes **faster than 50 ms** gets merged into the next one — the demo
+> downstream (mock) finishes a whole layer in a few milliseconds, so a plan that is
+> genuinely 2 layers was reported as 1 and the "theoretical minimum" came out wrong.
+> And that is the most common kind of downstream (a local echo, a short script).
+
+The theoretical minimum is the sum of each layer's "slowest task".
 
 > **This is a lower bound for the layering, not a strict critical path** — a strict
 > critical path needs the dependency graph from the plan, which is not persisted. So

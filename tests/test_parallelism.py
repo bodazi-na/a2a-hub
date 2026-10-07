@@ -242,6 +242,31 @@ def test_over_threshold_stays_separate() -> list:
     ]
 
 
+def test_fast_layers_still_split() -> list:
+    """**整层比容差还快时，仍必须正确分层。**
+
+    实测踩到的真实场景：演示下游（mock）整层几毫秒就跑完，于是「启动时刻相差
+    50ms」这条判据完全失效 —— 一个本该 2 层的 plan 被判成 1 层，「理论最短」
+    跟着算错。而这恰恰是最常见的下游类型（本地 echo、短脚本）。
+
+    修法是加一条更硬的判据：**启动时刻不早于当前层的最晚结束时刻** ⇒ 新层。
+    那是严格分层的定义，比阈值可靠。
+    """
+    print("\n[快下游] 整层 5ms 跑完，仍要分出 2 层")
+    r = analyze([task("a", 0, 5), task("b", 0, 5), task("c", 0, 5),
+                 task("merge", 5, 3)])
+    return [
+        check("分出 2 层（阈值判据在此完全失效）",
+              len(r["layers"]) == 2, f"实际 {len(r['layers'])} 层"),
+        check("层0 = 3 路并行", r["layers"][0]["tasks"] == 3),
+        check("层1 = 汇总", r["layers"][1]["tasks"] == 1),
+        check("理论最短 = 5 + 3 = 8ms",
+              approx(r["theoreticalMs"], 8, 0.5),
+              f"实际 {r['theoreticalMs']:.1f}"),
+        check("峰值 = 3", r["peakParallelism"] == 3),
+    ]
+
+
 CASES = [
     ("空输入", test_empty),
     ("单任务", test_single),
@@ -255,6 +280,7 @@ CASES = [
     ("实测形状", test_real_drill_shape),
     ("已知局限：亚阈值并层", test_sub_threshold_serial_tasks_merge),
     ("对照：超阈值正常分层", test_over_threshold_stays_separate),
+    ("快下游仍正确分层", test_fast_layers_still_split),
 ]
 
 

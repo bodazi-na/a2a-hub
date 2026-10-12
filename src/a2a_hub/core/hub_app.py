@@ -50,6 +50,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from a2a_hub.adapters.base import Adapter
+from a2a_hub.core.netguard import TargetPolicy
 from a2a_hub.core.orchestrator import Orchestrator, PlanError
 from a2a_hub.core.parallelism import analyze
 from a2a_hub.core.registry import Registry
@@ -396,6 +397,7 @@ class Hub:
         public_url: str | None = None,
         auth_token: str | None = None,
         workspace_dir: str | None = None,
+        target_policy: Any = None,
     ):
         self.store = store
         self.registry = registry
@@ -436,6 +438,9 @@ class Hub:
         # 就散落在那种地方。
         self.workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd() / "workspace"
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        # 出网护栏策略（见 core/netguard.py）。按需构建的适配器要用同一份口径，
+        # 否则「注册时卡住、运行时不卡」——或者反过来，两条路不一致。
+        self.target_policy = target_policy or TargetPolicy()
 
     def _context_lock(self, context_id: str, agent: str) -> asyncio.Lock:
         key = (context_id, agent)
@@ -1666,7 +1671,8 @@ class Hub:
         if record.kind == "a2a_http" and record.endpoint:
             from a2a_hub.adapters.a2a_http import A2AHttpAdapter
 
-            adapter = A2AHttpAdapter(record.name, record.endpoint)
+            adapter = A2AHttpAdapter(record.name, record.endpoint,
+                                     policy=self.target_policy)
 
         elif record.kind == "cli":
             from a2a_hub.adapters import cli as cli_mod

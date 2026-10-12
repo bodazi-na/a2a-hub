@@ -57,6 +57,36 @@ from a2a_hub.adapters.cli import DshCLI
 
 ### 新增
 
+**出网护栏：定向 SSRF 防护**
+
+下游 Agent Card 里的 `supportedInterfaces[].url` 原本被**直接采信** —— 也就是
+下游自己指定我们的请求目标。于是「注册一个不可信的下游」≈「拿到一条向内网
+发 POST 的通道」，响应体还会被解析回传；落到云主机上就是 `169.254.169.254`
+（实例凭据端点）。
+
+现在新增 `core/netguard.py`，**每次出网**（拉卡片 / probe / 派活）都过一遍判定：
+
+- **拦**：链路本地（含云元数据）、私网（RFC1918 + **CGNAT `100.64/10`**）、
+  保留段、组播、非 http(s)
+- **放行**：回环（**刻意** —— hub 的主场景就是本机下游）、公网、域名
+
+新增 `--allow-local-targets`（`register` / `serve` / `probe` 都支持）放开**私网**目标
+（回环默认就放行）；**链路本地没有开关**。命中拦截时注册**直接失败（退出码 3）**，
+不会把可疑地址写进库 —— 一旦落库，之后每次 probe 与派活都会再用它一次。
+
+过程中修掉三个坑，都是**会静默失效**的那类：
+
+| 坑 | 症状 | 修法 |
+| --- | --- | --- |
+| 重写了不存在的 `transport.connect_tcp()` | httpx 0.28 的 `AsyncHTTPTransport` **没有**这个方法（只有 `handle_async_request`/`aclose`），重写是死代码。IP 字面量因入口预检仍被拦、**看起来「管用」**，而域名目标溜到真正建连 | 改包 `self._pool._network_backend`，在每次 TCP 建连时判定 |
+| 以为连接层的 `host` 是解析后的 IP | 实测后端收到的是 `'localhost'` 而非 `127.0.0.1` —— **解析到内网的域名畅通无阻**（正是 rebinding 场景） | 显式 `getaddrinfo` 后对**每个**结果过判定，不只查第一个 |
+| 靠 `is_private` 判私网 | 它是个「桶」：把 RFC1918/回环/保留段混在一起返回 True，却对 **CGNAT `100.64/10` 返回 False** ⇒ 静默放行；同时 `is_global` 对组播返回 True | 改显式网段表，`is_private` 降级为兜底 |
+
+配套 `tests/test_ssrf_guard.py`（**71 项断言**，纳入单元档）：含「必须拦」与
+「必须放行」两组**对照面** —— 只有拦没有放行的测试分不清「护栏正确」和「护栏拦一切」。
+连接层用例走**真实 client**（直连 transport 内部方法的测试测不出上面第一个坑）。
+设计取舍详见 [ADR-009](docs/adr/009-ssrf-egress-guard.md)。
+
 **打包成 exe（Windows，免安装）**
 
 - `packaging/hub.spec` + `tools/build_exe.py`：一条命令打成免安装 exe。

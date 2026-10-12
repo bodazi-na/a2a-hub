@@ -30,6 +30,17 @@ hidden = collect_submodules("uvicorn") + [
     # starlette 内部有少量延迟导入
     "starlette.middleware",
     "starlette.middleware.base",
+    # netguard 的网络护栏**在函数内部**延迟 import `httpcore._backends.auto`
+    # （见 core/netguard.py 的 _GuardedNetworkBackend）。函数体内的延迟导入
+    # 静态分析看不到，所以显式收一下。
+    #
+    # **实测结论：这一步目前是「保险」而非「修错」**。去掉它再打包，护栏仍然
+    # 正常工作 —— 因为 httpx 静态依赖 httpcore，PyInstaller 顺着依赖链已经把
+    # `httpcore._backends.auto` 收进去了（两种 bundle 的 probe 都正常返回 down，
+    # 没有 ModuleNotFoundError）。留着它的理由是不依赖那条间接链：
+    # httpx 哪天改成延迟 import httpcore，漏收的后果是「打包成功、启动成功、
+    # **一用到护栏就炸**」—— 而那时不会有任何测试变红。
+    *collect_submodules("httpcore"),
 ]
 
 a = Analysis(

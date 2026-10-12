@@ -348,6 +348,38 @@ python hub.py serve --token <your-token>     # 或 export HUB_TOKEN=<your-token>
 
 未通过时返回 401 + `WWW-Authenticate: Bearer`。token 比较用 `hmac.compare_digest`（定长比较）。
 
+## 出网护栏（防 SSRF）
+
+hub 对下游地址**不是自己决定的**：除了 `register --endpoint`，还会采信
+**下游 Agent Card 里声明的 `supportedInterfaces[].url`**。
+
+于是「注册一个不可信的下游」≈「拿到一条向内网发请求的通道」。所以每次出网
+（拉卡片、probe、派活）都会先过一遍护栏：
+
+| 目标 | 默认 | 说明 |
+| --- | --- | --- |
+| 链路本地 `169.254.0.0/16` | **拦** | 云实例元数据端点（`169.254.169.254`）在这里 —— 这是护栏存在的主要理由 |
+| 私网 `10/8`、`172.16/12`、`192.168/16`、`100.64/10`（CGNAT） | **拦** | hub 不该被当内网跳板 |
+| IPv6 链路本地 / unique-local | **拦** | `fe80::/10`、`fc00::/7` |
+| 保留段、组播、非 http(s) | **拦** | |
+| **回环 `127.0.0.0/8`、`::1`** | **放行** | **刻意如此**：hub 的主场景就是本机下游（本地桥、本机 mock） |
+| 公网 / 域名 | 放行 | 域名在**真正建连时**解析后判定 —— 防 DNS rebinding |
+
+**为什么放行回环**：一刀拦掉会砍掉主用法。而一个砍掉主用法的默认值，
+最后一定会被使用者整体关掉，连带真正该拦的也一起放行 ——
+**能长期开着的默认值比理论上更严的默认值有用。**（理由详见 ADR-009）
+
+**回环默认就是放行的**（本机下游是主场景），所以下面这个开关实际只额外放开**私网**：
+
+```bash
+python hub.py register --name lan-agent --endpoint http://192.168.1.20:9100 --allow-local-targets
+python hub.py serve --allow-local-targets        # 派活/探测侧也要一起给
+```
+
+**链路本地没有开关** —— 没有任何说得通的用例需要 hub 访问 `169.254.0.0/16`。
+命中拦截时注册会**直接失败（退出码 3）**，不会把可疑地址写进注册表：
+一旦落库，之后每次 probe 与派活都会再用它一次。
+
 ## 让任意 Agent 平台调用 hub
 
 各个平台的扩展机制并不统一：WorkBuddy / DSH 用 **skills**，Codex / Qoder / Claude Code 用 **MCP**。
@@ -817,7 +849,7 @@ python tests/run_all.py --all    # 再加集成级（需真实 CLI / hub 在跑�
 
 | 档 | 数量 | 依赖 |
 | --- | --- | --- |
-| 单元级 | 13 套 | 无（假适配器 + 内存 Store） |
+| 单元级 | 14 套 | 无（假适配器 + 内存 Store） |
 | 平台级 | 2 套 | 会起真实进程，但只用 `sys.executable`；非 Windows 自动跳过 |
 | 集成级 | 6 套 | 真实 CLI / Windows 进程命令 / hub 在跑 |
 

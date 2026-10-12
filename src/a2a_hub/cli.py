@@ -53,11 +53,41 @@ ROOT = _base_dir()
 
 from a2a_hub.adapters.a2a_http import A2AHttpAdapter   # noqa: E402
 from a2a_hub.core.hub_app import Hub                   # noqa: E402
+from a2a_hub.core.netguard import (                    # noqa: E402
+    NetworkGuardError,
+    TargetPolicy,
+    check_url,
+)
 from a2a_hub.core.registry import AgentRecord, Registry  # noqa: E402
 from a2a_hub.core.router import Router                 # noqa: E402
 from a2a_hub.core.store import Store                   # noqa: E402
 
 DEFAULT_DB = ROOT / "data" / "hub.db"
+
+
+def _target_policy(args: argparse.Namespace) -> TargetPolicy:
+    """从命令行/环境变量解读出网护栏策略。
+
+    默认：**拦链路本地与私网，放行回环** —— 本机下游是主场景，
+    拦掉它等于砍掉主用法；而云元数据（169.254.169.254）这类必须默认拦住。
+
+    `--allow-local-targets` **只额外放开私网**（回环本来就是放行的）——
+    名字保留是为了跟用户心智一致（「允许本机/内网目标」），
+    但实现上它只改一个旋钮。不拆成多个开关，是为了避免
+    「开了一个忘了另一个」的中间态。
+
+    链路本地没有对应开关 —— 见 `TargetPolicy.allow_link_local` 的说明。
+    """
+    allow = bool(getattr(args, "allow_local_targets", False))
+    if not allow and os.environ.get("HUB_ALLOW_LOCAL_TARGETS", "").strip() in ("1", "true", "yes"):
+        allow = True
+    if allow:
+        return TargetPolicy(allow_loopback=True, allow_private=True)
+    return TargetPolicy()
+
+
+def _build_adapter(name: str, endpoint: str, policy: TargetPolicy) -> A2AHttpAdapter:
+    return A2AHttpAdapter(name, endpoint, policy=policy)
 
 
 def _configure_stdio() -> None:
@@ -91,21 +121,28 @@ def _configure_stdio() -> None:
             pass          # 被重定向到不支持 reconfigure 的对象，跳过即可
 
 
-def build_hub(db_path: Path, *, auth_token: str | None = None) -> Hub:
-    """从持久化的注册表重建整个 hub —— 这正是「重启后一切还在」的落点。"""
+def build_hub(db_path: Path, *, auth_token: str | None = None,
+              target_policy: TargetPolicy | None = None) -> Hub:
+    """从持久化的注册表重建整个 hub —— 这正是「重启后一切还在」的落点。
+
+    `target_policy` 会传给这里构建的、以及 Hub 之后**按需构建**的适配器
+    （见 `Hub._get_adapter`）—— 两条路必须同一份口径，否则会出现
+    「注册时拦住了、派活时没拦」这种最糟的不一致。
+    """
+    policy = target_policy or TargetPolicy()
     store = Store(db_path)
     registry = Registry(store)
     router = Router(registry)
     adapters = {}
     for rec in registry.list(enabled_only=False):
         if rec.kind == "a2a_http" and rec.endpoint:
-            adapters[rec.name] = A2AHttpAdapter(rec.name, rec.endpoint)
+            adapters[rec.name] = _build_adapter(rec.name, rec.endpoint, policy)
     # 下游 agent 的工作目录**必须显式传**，不能用 Hub 的默认值（`Path.cwd()`）：
     # 双击 exe 时 cwd 是「当时碰巧在哪」，可能是桌面、也可能是 C:\Windows\System32，
     # 于是 workspace/ 就散落在那种地方。这里用 ROOT —— 它已经做了 frozen 判断，
     # 源码运行时是仓库根、打包后是 exe 所在目录，两种形态行为一致。
     hub = Hub(store, registry, router, adapters, auth_token=auth_token,
-              workspace_dir=str(ROOT / "workspace"))
+              workspace_dir=str(ROOT / "workspace"), target_policy=policy)
     # 启动时结算上次进程遗留的活跃任务，别让它们永远卡在 working（A2A-09）
     orphans = hub.recover_orphans()
     if orphans:
@@ -178,7 +215,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         )
         raise SystemExit(2)
 
-    hub = build_hub(Path(args.db), auth_token=token)
+    hub = build_hub(Path(args.db), auth_token=token,
+                    target_policy=_target_policy(args))
     names = [a.name for a in hub.registry.list(enabled_only=False)]
     # URL 里的 IPv6 要带方括号（`http://::1:9200` 是无效写法），
     # 而绑定时**不能**带 —— 所以展示用带括号的，绑定用归一化后的。
@@ -195,7 +233,20 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_register(args: argparse.Namespace) -> None:
-    hub = build_hub(Path(args.db))
+    policy = _target_policy(args)
+
+    # 出网护栏先于建 hub：**绝不能**在拦截命中后还把这个地址写进注册表 ——
+    # 一旦落库，此后每次 probe 与每次派活都会再用它一次，
+    # 变成「注册时骂了一句、之后照样打内网」。
+    if args.kind == "a2a_http" and args.endpoint:
+        try:
+            check_url(args.endpoint, policy=policy)
+        except NetworkGuardError as exc:
+            print(f"[!] 拒绝注册 {args.name}：{exc}")
+            print("    要放行本机/内网目标，请在命令上加 --allow-local-targets。")
+            raise SystemExit(3) from None
+
+    hub = build_hub(Path(args.db), target_policy=policy)
 
     # CLI 类的配置（命令 / 工作目录 / 模型 / 环境变量）从 --config 读
     config: dict = {}
@@ -214,7 +265,7 @@ def cmd_register(args: argparse.Namespace) -> None:
         if not args.endpoint:
             raise SystemExit("a2a_http 类型必须给 --endpoint")
         try:
-            adapter = A2AHttpAdapter(args.name, args.endpoint)
+            adapter = _build_adapter(args.name, args.endpoint, policy)
             card = asyncio.run(adapter.get_card())
         except Exception as exc:  # noqa: BLE001
             print(f"[!] 拉取 Agent Card 失败：{type(exc).__name__}: {exc}")
@@ -264,7 +315,7 @@ def cmd_tasks(args: argparse.Namespace) -> None:
 
 
 def cmd_probe(args: argparse.Namespace) -> None:
-    hub = build_hub(Path(args.db))
+    hub = build_hub(Path(args.db), target_policy=_target_policy(args))
 
     async def run() -> None:
         # 走 Hub 而不是 Registry：CLI 类 agent 没有 endpoint，
@@ -299,6 +350,8 @@ def main() -> None:
     p.add_argument("--token", help="启用 Bearer 认证（也可用环境变量 HUB_TOKEN）")
     p.add_argument("--allow-insecure", action="store_true",
                    help="显式豁免「非回环绑定必须配认证」的启动护栏")
+    p.add_argument("--allow-local-targets", action="store_true",
+                   help="放开出网护栏：允许下游位于**私网**（回环本来就放行；链路本地仍拒绝）")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("register", help="注册下游 agent")
@@ -307,6 +360,8 @@ def main() -> None:
     p.add_argument("--kind", default="a2a_http", choices=["a2a_http", "cli"])
     p.add_argument("--tag", action="append", help="能力标签，可重复")
     p.add_argument("--config", help="CLI 类配置：JSON 字符串，或 .json 文件路径")
+    p.add_argument("--allow-local-targets", action="store_true",
+                   help="允许注册私网下游（回环本来就放行；链路本地仍拒绝）")
     p.set_defaults(func=cmd_register)
 
     p = sub.add_parser("unregister", help="移除下游 agent")
@@ -322,6 +377,8 @@ def main() -> None:
 
     p = sub.add_parser("probe", help="探测 agent 健康状态")
     p.add_argument("--name")
+    p.add_argument("--allow-local-targets", action="store_true",
+                   help="探测时允许私网目标（回环本来就放行；链路本地仍拒绝）")
     p.set_defaults(func=cmd_probe)
 
     args = ap.parse_args()

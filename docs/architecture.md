@@ -163,7 +163,7 @@ CLI 类少一层桥、少一个常驻进程，代价是自己管子进程生命�
    单行超限会抛 `LimitOverrunError` 并让整个 call 失败 —— 一条超大工具输出就能毁掉一轮。
    按块读 + 自己切行，超长行截断并计数。
 
-## 写 HTTP 适配器必踩的两个坑（实测）
+## 写 HTTP 适配器必踩的三个坑（实测）
 
 1. **本地探测必须 `trust_env=False`**。机器上若有系统代理（实测某台机器上是
    `127.0.0.1:7393`），`127.0.0.1` 的请求会被代理拦下并返回 **502**
@@ -172,6 +172,35 @@ CLI 类少一层桥、少一个常驻进程，代价是自己管子进程生命�
 2. **拉 Agent Card 与发 JSON-RPC 不要复用同一个 keep-alive 连接**。
    部分实现（实测 `codex-a2a`）在同一连接上先 GET 再 POST 会稳定返回 404。
    适配器里每次请求都用独立的 `AsyncClient`。
+3. **不准采信下游卡片声明的端点**。`supportedInterfaces[].url` 是下游自己写的，
+   等于让它指定我们的请求目标。全部出网都过 `core/netguard.py`（见下节）。
+
+## 出网护栏：为什么落在连接层
+
+hub 的请求目标有两个来源，其中**下游 Agent Card 是攻击者可控的** ——
+`_pick_rpc_url()` 采信卡片里的 `supportedInterfaces[].url`，
+于是「注册一个恶意下游」≈「拿到一条向内网发 POST 的通道」。
+
+护栏（`core/netguard.py`）拦链路本地 / 私网 / 保留段，**放行回环**
+（回环是 hub 的主场景，拦掉等于砍掉主用法 —— 理由见 ADR-009）。
+
+**判定位置很关键，踩过两次坑：**
+
+1. **只在入口预检不够**。`_pick_rpc_url()` 是「先拉卡片、再按卡片内容请求」——
+   最终目标运行时才确定，注册时根本不知道会连到哪。
+2. **必须落在 `httpcore` 的网络后端，不是 httpx 的 transport**。
+   第一版重写了 `httpx.AsyncHTTPTransport.connect_tcp()`，而
+   **httpx 0.28 没有这个方法**（只有 `handle_async_request` / `aclose`）——
+   那个重写是死代码。症状极具迷惑性：IP 字面量因为入口预检仍被拦、看起来「管用」，
+   而**域名形式的目标会溜到真正建连**。所以现在包的是
+   `self._pool._network_backend`，它在**每一次 TCP 建连**时被调用。
+3. **连接层拿到的 host 是未解析的域名**。实测后端收到的 `host` 是 `'localhost'`
+   而不是 `127.0.0.1` —— 解析发生在后端内部。所以护栏显式做
+   「`socket.getaddrinfo` → 对**每个**结果过一遍判定」；
+   只查第一个地址会给攻击者留一个「把内网地址排在后面」的机会。
+
+**装不上护栏时必须抛异常**：`_pool._network_backend` 是 httpx 内部结构，
+万一变了要**大声失败** —— 「以为有护栏、实际裸奔」比起不来危险得多。
 
 ## 目录分层：代码 / 运行时 / 本机配置
 
@@ -181,7 +210,7 @@ CLI 类少一层桥、少一个常驻进程，代价是自己管子进程生命�
 a2a-hub/                     ← 代码层（进仓库）
 ├── src/a2a_hub/             **唯一的顶层包**（装进环境后只占这一个名字）
 │   ├── cli.py               命令行入口（a2a-hub / python -m a2a_hub）
-│   ├── core/                store · registry · router · orchestrator · parallelism · hub_app · console
+│   ├── core/                store · registry · router · orchestrator · parallelism · hub_app · console · netguard
 │   ├── adapters/            base · a2a_http · cli
 │   ├── probes/              process_monitor（本机进程探测）
 │   └── mcp_facade/          可选：把 hub 包成 MCP server

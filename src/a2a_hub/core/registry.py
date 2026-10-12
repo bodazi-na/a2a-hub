@@ -16,8 +16,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-
+from .netguard import check_url, make_client
 from .store import Store
 
 A2A_CARD_PATH = "/.well-known/agent-card.json"
@@ -153,10 +152,16 @@ class Registry:
 
     @staticmethod
     async def _fetch_card(endpoint: str, *, timeout: float) -> dict[str, Any] | None:
-        """拉 Agent Card；任何失败都返回 None（调用方据此判定 down）。"""
+        """拉 Agent Card；任何失败都返回 None（调用方据此判定 down）。
+
+        出网走网络护栏（`netguard.make_client`）：这里的 endpoint 来自
+        注册表，可能是运维填的、也可能是「探测时从卡片里刷新进来的」，
+        统一按不可信目标处理。
+        """
         url = endpoint.rstrip("/") + A2A_CARD_PATH
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            check_url(url)
+            async with make_client(timeout=timeout) as client:
                 resp = await client.get(url)
             if resp.status_code != 200:
                 return None

@@ -57,6 +57,7 @@ UNIT = [
     ("test_streaming", "流式 SSE：边跑边到 / 时间戳=发生时刻 / 背压（假适配器）"),
     ("test_parallelism", "并行度：分层推断 / 平均与峰值 / 空闲率（纯函数）"),
     ("test_no_stale_refs", "守卫：仓库里没有残留的旧布局导入/调用（纯文本扫描）"),
+    ("test_ssrf_guard", "SSRF 护栏：拦内网/元数据、放行回环、连接层真拦（不打真网络）"),
 ]
 
 # 平台级：会**真的起进程**（用 sys.executable，不依赖任何外部 CLI），

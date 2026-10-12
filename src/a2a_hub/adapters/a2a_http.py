@@ -8,11 +8,14 @@
 Agent Card + SendMessage + GetTask 三件事，自己实现更可控，
 也让内核少一个重依赖（对「可复用开源框架」这个定位很重要）。
 
-两条必须遵守的约束，都来自归档里的实测教训：
+三条必须遵守的约束：
   1. **拉 Agent Card 与发 JSON-RPC 不复用同一个 keep-alive 连接** ——
      部分实现（codex-a2a）在同一连接上先 GET 再 POST 会稳定返回 404。
      这里每次请求都用独立的 AsyncClient。
   2. **trust_env=False** —— 本机系统代理会把 127.0.0.1 的请求变成 502。
+  3. **每次出网都过网络护栏**（`core/netguard.py`）—— 请求目标可能是
+     下游卡片自己声明的（`supportedInterfaces[].url`），不是我们选的。
+     详见该模块的说明。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from ..core.netguard import TargetPolicy, check_url, make_client
 from .base import (
     EVENT_STATUS,
     EVENT_TEXT,
@@ -119,11 +123,15 @@ class A2AHttpAdapter(Adapter):
         *,
         token: str | None = None,
         poll_interval: float = 1.5,
+        policy: TargetPolicy | None = None,
         **options: Any,
     ):
         super().__init__(name, endpoint, **options)
         self.token = token
         self.poll_interval = poll_interval
+        # 网络护栏策略：默认拦内网/链路本地，放行回环（hub 的主场景是本机下游）。
+        # 从 config 里放宽时**必须显式**，见 netguard.TargetPolicy 的说明。
+        self.policy = policy or TargetPolicy()
         # 最近一次探测拿到的 Agent Card，供 Hub 刷新注册表用（A2A-12）
         self.last_card: dict[str, Any] | None = None
         # 实际使用的 JSON-RPC 端点，由 get_card 按 supportedInterfaces 决定（A2A-15）
@@ -140,10 +148,14 @@ class A2AHttpAdapter(Adapter):
     async def get_card(self) -> dict[str, Any]:
         assert self.endpoint, "A2A 适配器必须有 endpoint"
         url = self.endpoint.rstrip("/") + CARD_PATH
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        # 静态预检：URL 里直接写 IP 字面量时快速失败，给一条能看懂的报错。
+        # 写域名的目标要等连接层才能真正判定（GuardedTransport 负责）。
+        check_url(url, policy=self.policy)
+        async with make_client(timeout=15.0, policy=self.policy,
+                               headers=self._headers()) as client:
             # 卡片端点也可能要求认证（A2A-16）：不带 token 会被 401，
             # 结果就是「RPC 能用但健康检查永远 down」。
-            resp = await client.get(url, headers=self._headers())
+            resp = await client.get(url)
             resp.raise_for_status()
             card = resp.json()
         self.last_card = card
@@ -153,7 +165,12 @@ class A2AHttpAdapter(Adapter):
         return card
 
     def _pick_rpc_url(self, card: dict[str, Any]) -> str:
-        """从 supportedInterfaces 里挑一个 JSONRPC 端点；挑不到就退回 base + '/'。"""
+        """从 supportedInterfaces 里挑一个 JSONRPC 端点；挑不到就退回 base + '/'。
+
+        **这里是 SSRF 的关键入口**：卡片是下游自己声明的，等于让它指定我们的
+        请求目标。所以挑出来的 URL 必须先过一遍静态预检（IP 字面量直接拒），
+        写域名的则由连接层兜住 —— 两处都要有，只靠任一处都能被绕。
+        """
         interfaces = card.get("supportedInterfaces") or []
         for itf in interfaces:
             if not isinstance(itf, dict):
@@ -161,7 +178,13 @@ class A2AHttpAdapter(Adapter):
             binding = str(itf.get("protocolBinding") or "").upper().replace("-", "")
             url = itf.get("url")
             if url and binding in ("JSONRPC", ""):
-                return str(url)
+                candidate = str(url)
+                try:
+                    check_url(candidate, policy=self.policy)
+                except Exception as exc:   # noqa: BLE001
+                    print(f"[!] 忽略 Agent Card 声明的 RPC 端点（{exc}）")
+                    continue
+                return candidate
         return self.endpoint.rstrip("/") + "/"
 
     async def probe(self) -> str:
@@ -183,9 +206,11 @@ class A2AHttpAdapter(Adapter):
         assert self.endpoint, "A2A 适配器必须有 endpoint"
         # 优先用卡片声明的端点；还没拉过卡片时退回 base + '/'
         url = self.rpc_url or (self.endpoint.rstrip("/") + "/")
+        check_url(url, policy=self.policy)
         body = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            resp = await client.post(url, json=body, headers=self._headers())
+        async with make_client(timeout=timeout, policy=self.policy,
+                               headers=self._headers()) as client:
+            resp = await client.post(url, json=body)
             resp.raise_for_status()
             payload = resp.json()
         if "error" in payload:

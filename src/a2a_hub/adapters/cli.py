@@ -934,6 +934,14 @@ class QoderCLI(ClaudeStyleCLI):
 # jsonl 族：dsh —— 逐行 NDJSON
 # ---------------------------------------------------------------------------
 
+# `dsh: MISSING_CREDENTIAL: ...` —— 程序名 + 全大写错误码构成的前缀。
+_CLI_ERROR_PREFIX_RE = re.compile(r"^[A-Za-z][\w.+-]*:\s*[A-Z][A-Z0-9_]*:\s*")
+
+
+def _strip_cli_error_prefix(line: str) -> str:
+    """去掉 `dsh: CODE: ` 前缀，只留正文，用于和 stdout 侧的 message 比对。"""
+    return _CLI_ERROR_PREFIX_RE.sub("", line, count=1).strip()
+
 
 class DshCLI(CLIAdapter):
     """`dsh --profile headless --json`。
@@ -969,6 +977,20 @@ class DshCLI(CLIAdapter):
             if phase == "turn_end":
                 reason = obj.get("reason") or {}
                 state["turn_end_reason"] = reason.get("kind")
+                # DSH 把真实原因放在 `reason.error` 里，例如：
+                #   {"kind":"error","error":{"code":"MISSING_CREDENTIAL",
+                #     "message":"llm-deepseek: no API key for provider route ..."}}
+                # 只留 `kind` 等于把**唯一**能定位问题的字段丢掉 —— 2026-10-25
+                # 实测：一次凭据缺失在 hub 侧只剩 `turn_end reason=error`，
+                # 排查成本被这个省略放大了几十倍。
+                detail = reason.get("error")
+                if isinstance(detail, dict):
+                    code = str(detail.get("code") or "").strip()
+                    message = str(detail.get("message") or "").strip()
+                    if code or message:
+                        state["turn_end_error"] = {"code": code, "message": message}
+                elif isinstance(detail, str) and detail.strip():
+                    state["turn_end_error"] = {"code": "", "message": detail.strip()}
             return [Event(
                 kind=EVENT_STATUS,
                 text=f"{phase} turn={obj.get('turn')}",
@@ -1005,9 +1027,34 @@ class DshCLI(CLIAdapter):
     def finalize(self, state: dict[str, Any], returncode: int) -> CLIOutcome:
         reason = state.get("turn_end_reason")
         ok = returncode == 0 and reason in (None, "completed")
+        detail = state.get("turn_end_error") or {}
+        code = str(detail.get("code") or "")
+        message = str(detail.get("message") or "")
         error = None
         if not ok:
-            error = f"turn_end reason={reason}" if reason else f"退出码 {returncode}"
+            # 报错要带**原因**，不能只报一个枚举值。这里必须自己拼好，
+            # 不能指望基类第 501 行的 stderr 兜底 —— 兜底只在 error 为空时生效，
+            # 而本方法一定会填 error，于是兜底永远不触发、stderr 被丢弃。
+            head = f"turn_end reason={reason}" if reason else f"退出码 {returncode}"
+            if code:
+                head += f" ({code})"
+            segments = [head]
+            if message:
+                segments.append(message)
+            # stderr 往往是同一句话加个 `dsh: CODE: ` 前缀，直接整段追加会读成
+            # 「发生了两件事」。逐行比对正文，只补 message 里没有的部分。
+            extra: list[str] = []
+            for line in str(state.get("stderr_tail") or "").splitlines():
+                line = line.strip()
+                if not line or line in message:
+                    continue
+                core = _strip_cli_error_prefix(line)
+                if core and core in message:
+                    continue
+                extra.append(line)
+            if extra:
+                segments.append(" ".join(extra))
+            error = " | ".join(segments)
         return CLIOutcome(
             ok=ok,
             text=state.get("final") or "",
@@ -1015,6 +1062,7 @@ class DshCLI(CLIAdapter):
             usage=state.get("usage") or {},
             metadata={
                 "turnEndReason": reason,
+                **({"turnEndErrorCode": code} if code else {}),
                 **self._stream_stats(state),
             },
             error=error,

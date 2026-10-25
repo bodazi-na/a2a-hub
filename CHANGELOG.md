@@ -3,6 +3,28 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **`dsh-cli` 失败时只报 `turn_end reason=error`，把真实原因整个丢掉**
+  DSH 在 `turn_end` 事件里其实已经把原因写在 `reason.error` 下：
+
+  ```json
+  {"type":"status","phase":"turn_end","turn":1,
+   "reason":{"kind":"error","error":{"code":"MISSING_CREDENTIAL",
+     "message":"llm-deepseek: no API key for provider route \"deepseek-official\""}}}
+  ```
+
+  但 `DshCLI.parse_line` 只取了 `reason["kind"]`，`reason["error"]` 完全没看；
+  `DshCLI.finalize` 又必定填上 error，于是基类「error 为空才用 stderr 兜底」那条
+  永远不触发，**已经采集到的 stderr 也被丢弃**。结果是「有全部证据，却报出信息量
+  最小的那个字符串」——2026-10-25 一次凭据缺失因此多花了几十倍的排查成本。
+
+  现在 error 会带上错误码与说明，并逐行补上 stderr 中 message 没覆盖的部分
+  （`dsh: CODE: ` 前缀会先剥掉再比对，避免同一句话被贴两遍）；`metadata` 增加
+  `turnEndErrorCode`。回归测试见 `tests/test_dsh_error_detail.py`。
+
 ## [0.2.0] — 2026-10-13
 
 首个对外可用的版本。此前只有内部基线。

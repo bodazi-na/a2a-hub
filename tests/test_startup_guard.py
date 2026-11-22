@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -25,11 +26,13 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 # 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
+from a2a_hub import cli  # noqa: E402
 from a2a_hub.cli import _is_loopback, _normalize_host  # noqa: E402
 
 PY = sys.executable
@@ -123,6 +126,31 @@ def test_empty_token_is_not_auth() -> list:
     print("\n[绕过] --token '' 不算有效认证")
     code, _out, _ = serve("0.0.0.0", ["--token", ""])
     return [check("仍被拒绝（退出码 2）", code == 2, f"实际 {code}")]
+
+
+def test_whitespace_token_is_not_auth() -> list:
+    out = []
+    for source, arg_token, env_token in (
+        ("--token", " \t ", ""),
+        ("HUB_TOKEN", None, " \t "),
+    ):
+        args = argparse.Namespace(
+            token=arg_token, host="0.0.0.0", allow_insecure=False,
+            db="unused.db", port=PORT,
+        )
+        with (
+            patch.dict(os.environ, {"HUB_TOKEN": env_token}),
+            patch.object(cli, "build_hub") as build,
+            patch("uvicorn.run") as run,
+        ):
+            exit_code = None
+            try:
+                cli.cmd_serve(args)
+            except SystemExit as exc:
+                exit_code = exc.code
+        out.append(check(f"{source} 纯空白时在启动前拒绝",
+                         exit_code == 2 and not build.called and not run.called))
+    return out
 
 
 def test_auth_and_override_pass() -> list:
@@ -247,6 +275,7 @@ CASES = [
     ("本机写法能起", test_loopback_spellings_actually_start),
     ("裸奔被拒", test_naked_start_refused),
     ("空 token 不算认证", test_empty_token_is_not_auth),
+    ("纯空白 token 不算认证", test_whitespace_token_is_not_auth),
     ("认证与豁免放行", test_auth_and_override_pass),
     ("重定向时横幅不丢", test_banner_survives_redirect),
     ("认证真的拦得住", test_auth_actually_blocks),

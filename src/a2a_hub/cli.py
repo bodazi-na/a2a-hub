@@ -141,13 +141,8 @@ def build_hub(db_path: Path, *, auth_token: str | None = None,
     # 双击 exe 时 cwd 是「当时碰巧在哪」，可能是桌面、也可能是 C:\Windows\System32，
     # 于是 workspace/ 就散落在那种地方。这里用 ROOT —— 它已经做了 frozen 判断，
     # 源码运行时是仓库根、打包后是 exe 所在目录，两种形态行为一致。
-    hub = Hub(store, registry, router, adapters, auth_token=auth_token,
-              workspace_dir=str(ROOT / "workspace"), target_policy=policy)
-    # 启动时结算上次进程遗留的活跃任务，别让它们永远卡在 working（A2A-09）
-    orphans = hub.recover_orphans()
-    if orphans:
-        print(f"[hub] 已结算 {orphans} 个失去 worker 的孤儿任务（标记为 interrupted）")
-    return hub
+    return Hub(store, registry, router, adapters, auth_token=auth_token,
+               workspace_dir=str(ROOT / "workspace"), target_policy=policy)
 
 
 def _normalize_host(host: str) -> str:
@@ -196,7 +191,7 @@ def _is_loopback(host: str) -> bool:
 def cmd_serve(args: argparse.Namespace) -> None:
     import uvicorn
 
-    token = args.token or os.environ.get("HUB_TOKEN") or None
+    token = (args.token or os.environ.get("HUB_TOKEN") or "").strip() or None
 
     # 归一化只做一次，**判定与绑定用同一个值**。见 _normalize_host 的说明：
     # 只在判定处剥方括号的话，`--host [::1]` 护栏放行了、uvicorn 却绑不上。
@@ -217,6 +212,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     hub = build_hub(Path(args.db), auth_token=token,
                     target_policy=_target_policy(args))
+    # 管理命令也会打开同一数据库，只有服务启动时才结算旧进程的活跃任务（A2A-09）。
+    orphans = hub.recover_orphans()
+    if orphans:
+        print(f"[hub] 已结算 {orphans} 个失去 worker 的孤儿任务（标记为 interrupted）")
     names = [a.name for a in hub.registry.list(enabled_only=False)]
     # URL 里的 IPv6 要带方括号（`http://::1:9200` 是无效写法），
     # 而绑定时**不能**带 —— 所以展示用带括号的，绑定用归一化后的。

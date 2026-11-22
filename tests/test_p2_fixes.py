@@ -10,16 +10,21 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
 import tempfile
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
 
 # 包在 src 布局下（src/a2a_hub），所以要把 <仓库根>/src 放进 sys.path。
 # 不是仓库根 —— 仓库根下已经没有可导入的包了。
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
+from a2a_hub import cli as hub_cli                            # noqa: E402
 from a2a_hub.adapters.base import Adapter, CallResult          # noqa: E402
 from a2a_hub.adapters.cli import CLIAdapter                    # noqa: E402
 from a2a_hub.core.hub_app import Hub, clamp_limit, parse_timeout  # noqa: E402
@@ -183,6 +188,71 @@ def test_a2a_09_orphan_recovery() -> bool:
     return ok
 
 
+async def test_a2a_09_cli_recovery_boundary() -> bool:
+    print("\n[A2A-09] 管理命令不改变活跃任务，服务启动仍结算孤儿任务")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingEcho(EchoAdapter):
+        async def call(self, prompt, *, context_id=None, session_id=None, timeout=None):
+            started.set()
+            await release.wait()
+            return await super().call(
+                prompt, context_id=context_id, session_id=session_id, timeout=timeout,
+            )
+
+    with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+        root = Path(temp)
+        db = root / "hub.db"
+        stack.enter_context(patch.object(hub_cli, "ROOT", root))
+        build_hub = hub_cli.build_hub
+
+        def open_hub(*args, **kwargs):
+            hub = build_hub(*args, **kwargs)
+            stack.callback(hub.store.close)
+            return hub
+
+        stack.enter_context(patch.object(hub_cli, "build_hub", side_effect=open_hub))
+        hub = open_hub(db)
+        hub.registry.register(AgentRecord(name="echo", kind="test"))
+        hub._adapters["echo"] = ("", BlockingEcho())
+        sent = await hub._send_message({
+            "agent": "echo", "async": True,
+            "message": {"parts": [{"text": "test"}]},
+        })
+        task_id = sent["task"]["id"]
+        worker = hub._running[task_id]
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            hub_cli.cmd_tasks(argparse.Namespace(db=db, limit=20))
+            still_active = hub.store.get_task(task_id)["state"] == "working"
+        finally:
+            release.set()
+            await worker
+
+        completed = hub.store.get_task(task_id)["state"] == "completed"
+        has_artifact = len(hub.store.list_artifacts(task_id)) == 1
+        old_id = hub.store.create_task(context_id="", prompt="old", state="working")["id"]
+        old_task_at_start = None
+
+        def start_app(*args, **kwargs):
+            nonlocal old_task_at_start
+            old_task_at_start = hub.store.get_task(old_id)
+
+        with patch("uvicorn.run", side_effect=start_app):
+            hub_cli.cmd_serve(argparse.Namespace(
+                db=db, token=None, host="127.0.0.1", port=9200, allow_insecure=False,
+            ))
+        recovered = (
+            old_task_at_start is not None
+            and old_task_at_start["state"] == "failed"
+            and old_task_at_start["metadata"].get("interrupted") is True
+        )
+        print(f"    管理命令期间仍运行: {still_active}，完成并保存产物: {completed and has_artifact}")
+        print(f"    服务启动结算旧任务: {recovered}")
+        return still_active and completed and has_artifact and recovered
+
+
 # ---------------------------------------------------------------- A2A-08
 def test_a2a_08_config_change() -> bool:
     print("\n[A2A-08] 同名 agent 的配置变更后应重建适配器")
@@ -244,6 +314,7 @@ async def main() -> int:
         "A2A-17": test_a2a_17_fail_closed(),
         "A2A-21": test_a2a_21_self_reference(),
         "A2A-09": test_a2a_09_orphan_recovery(),
+        "A2A-09 CLI": await test_a2a_09_cli_recovery_boundary(),
         "A2A-08": test_a2a_08_config_change(),
         "A2A-07": await test_a2a_07_plan_completeness(),
     }

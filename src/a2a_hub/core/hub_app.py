@@ -1576,8 +1576,17 @@ class Hub:
         下游可能已经把文件写进了 workspace。所以错误文案里明确提示先验盘，
         而不是让调用方以为可以安全重跑。
         """
-        orphans = self.store.list_active_tasks()
-        for task in orphans:
+        recovered = 0
+        for task in self.store.list_active_tasks():
+            settled = self.store.update_task(
+                task["id"], state="failed",
+                error=("interrupted: hub 在任务执行期间重启。"
+                       "**该任务可能已产生副作用**（写入 workspace 的文件等）—— "
+                       "重跑前请先检查 workspace，不要仅凭 ok=false 判定它什么都没做。"),
+                finished=True, only_from=ACTIVE_STATES,
+            )
+            if not (settled or {}).get("_updated"):
+                continue
             self.store.add_message(
                 task["id"], role="agent", kind="status",
                 content=[{"text": (
@@ -1585,19 +1594,13 @@ class Hub:
                     "side effects (e.g. files written to workspace) may already exist"
                 )}],
             )
-            self.store.update_task(
-                task["id"], state="failed",
-                error=("interrupted: hub 在任务执行期间重启。"
-                       "**该任务可能已产生副作用**（写入 workspace 的文件等）—— "
-                       "重跑前请先检查 workspace，不要仅凭 ok=false 判定它什么都没做。"),
-                finished=True, only_from=ACTIVE_STATES,
-            )
             # metadata 用**原子合并**（P1-6），不要「读出来 → 整列替换」——
             # 那会与同时发生的 `dispatch_task` 补 planId 互相覆盖。
             self.store.merge_task_metadata(
                 task["id"], {"interrupted": True, "sideEffectsPossible": True}
             )
-        return len(orphans)
+            recovered += 1
+        return recovered
 
     async def probe_agent(self, name: str, *, timeout: float = 20.0) -> str:
         rec = self.registry.get(name)

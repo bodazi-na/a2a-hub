@@ -9,6 +9,8 @@ and **is itself a standard A2A agent**, so any A2A-speaking client can call it.
 
 **English** · [中文](README.md)
 
+**Current release** [v0.2.1 pre-release](https://github.com/bodazi-na/a2a-hub/releases/tag/v0.2.1)
+
 ---
 
 > ## 🤖 AI-Generated Content Notice
@@ -49,6 +51,19 @@ and **is itself a standard A2A agent**, so any A2A-speaking client can call it.
 any downstream action, so if the process crashes and restarts the task state is still
 queryable; a downstream failure never loses the task — it just moves it to `failed`
 with the reason recorded.
+
+## Downloads and upgrades
+
+v0.2.1 fixes management commands that marked live tasks as interrupted, authentication
+checks for whitespace-only tokens, and outbound address validation. It also preserves
+error codes and details from `dsh-cli`. See the [changelog](CHANGELOG.md#021--2026-11-22).
+
+On Windows x64, download the ZIP from the release page, extract it, and double-click
+`start-hub.bat`. The release also includes the standalone `a2a-hub.exe` and
+`SHA256SUMS.txt`.
+
+When upgrading from v0.2.0, stop the old service and copy your `data/`, `agents/`, and
+`workspace/` directories next to the new executable. The database uses SQLite schema v2.
 
 ## Quick start
 
@@ -380,8 +395,19 @@ python hub.py serve --token <your-token>     # or export HUB_TOKEN=<your-token>
 | `/console` | public | Just an HTML shell with no data; the `/admin/*` it calls still requires auth |
 | Everything else (all `/admin/*` and JSON-RPC) | **required** | `Authorization: Bearer <token>` |
 
-Failures return 401 + `WWW-Authenticate: Bearer`. Token comparison uses
-`hmac.compare_digest` (constant-time).
+Failures return 401 + `WWW-Authenticate: Bearer`. Startup trims surrounding
+whitespace from the token and treats a whitespace-only value as missing. Binding
+to a non-loopback address requires a token or an explicit `--allow-insecure` override.
+
+## Outbound network guard
+
+Each new outbound connection resolves the hostname once, checks every result, and
+dials only a validated numeric IP. HTTPS retains the original hostname for
+certificate verification. Resolution failures stop the connection.
+
+Loopback works by default. Trusted private-network agents require
+`--allow-local-targets` when registering, serving, or probing. Link-local targets
+stay blocked. See [ADR-009](docs/adr/009-ssrf-egress-guard.md).
 
 ## Letting any agent platform call the hub
 

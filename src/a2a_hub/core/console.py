@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from a2a_hub import __version__
+
 CONSOLE_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -216,7 +218,7 @@ function renderStats() {
   const running = (t.running || []).length;
   const ok = (t.recent || []).filter(x => x.state === "completed").length;
   const fail = (t.recent || []).filter(x => x.state === "failed").length;
-  $("#ver").textContent = h.schemaVersion != null ? "v0.2.0 · schema " + h.schemaVersion : "";
+  $("#ver").textContent = h.schemaVersion != null ? "v__HUB_VERSION__ · schema " + h.schemaVersion : "";
   $("#stats").innerHTML = [
     ["任务", h.tasks ?? "-"],
     ["Agent", h.agents ?? "-"],
@@ -594,4 +596,4 @@ loadAll();
 
 
 def render_console() -> str:
-    return CONSOLE_HTML
+    return CONSOLE_HTML.replace("__HUB_VERSION__", __version__)

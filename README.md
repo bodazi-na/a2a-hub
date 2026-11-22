@@ -6,6 +6,8 @@
 
 **中文** · [English](README.en.md)
 
+**当前版本** [v0.2.1 预发布](https://github.com/bodazi-na/a2a-hub/releases/tag/v0.2.1)
+
 ---
 
 > ## 🤖 AI 创作声明
@@ -40,6 +42,17 @@
 | **实时流** | `SendStreamingMessage`（SSE）；事件在**发生那一刻**推送，时间戳是发生时刻而非落库时刻 |
 
 **核心设计：先落库，再派活。** 任务在任何下游动作之前就已经写进 SQLite，所以进程崩了、重启了，任务状态依然查得到；下游失败也不会丢任务，只会置为 `failed` 并记下原因。
+
+## 下载与升级
+
+v0.2.1 修复了管理命令误结算运行中任务、空白 token 的启动检查和出网地址校验，并补全了
+`dsh-cli` 返回的错误码与失败原因。完整记录见 [CHANGELOG.md](CHANGELOG.md#021--2026-11-22)。
+
+Windows x64 用户可在发布页下载目录版 ZIP，解压后双击 `start-hub.bat`。发布页同时提供
+单文件 `a2a-hub.exe` 和 `SHA256SUMS.txt`。
+
+从 v0.2.0 升级时，先停止旧服务，再把原有的 `data/`、`agents/` 和 `workspace/`
+复制到新版本 exe 所在目录。此版本沿用 SQLite schema v2。
 
 ## 快速开始
 
@@ -346,7 +359,8 @@ python hub.py serve --token <your-token>     # 或 export HUB_TOKEN=<your-token>
 | `/console` | 公开 | 只是 HTML 壳，不含数据；它调的 `/admin/*` 仍需认证 |
 | 其余（含所有 `/admin/*` 与 JSON-RPC） | **需要** | `Authorization: Bearer <token>` |
 
-未通过时返回 401 + `WWW-Authenticate: Bearer`。token 比较用 `hmac.compare_digest`（定长比较）。
+未通过时返回 401 + `WWW-Authenticate: Bearer`。启动时会去掉 token 首尾空白，纯空白值
+按未配置处理。绑定非回环地址需要有效 token，`--allow-insecure` 可显式豁免。
 
 ## 出网护栏（防 SSRF）
 
@@ -363,7 +377,9 @@ hub 对下游地址**不是自己决定的**：除了 `register --endpoint`，�
 | IPv6 链路本地 / unique-local | **拦** | `fe80::/10`、`fc00::/7` |
 | 保留段、组播、非 http(s) | **拦** | |
 | **回环 `127.0.0.0/8`、`::1`** | **放行** | **刻意如此**：hub 的主场景就是本机下游（本地桥、本机 mock） |
-| 公网 / 域名 | 放行 | 域名在**真正建连时**解析后判定 —— 防 DNS rebinding |
+| 公网 / 域名 | 按地址策略判定 | 每次新建连接时解析一次域名，校验全部结果，只拨号到通过校验的数字 IP |
+
+HTTPS 继续使用原 URL 的域名进行证书校验。解析失败时直接结束连接。
 
 **为什么放行回环**：一刀拦掉会砍掉主用法。而一个砍掉主用法的默认值，
 最后一定会被使用者整体关掉，连带真正该拦的也一起放行 ——

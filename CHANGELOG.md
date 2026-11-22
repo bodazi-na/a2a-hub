@@ -5,8 +5,14 @@
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-11-22
+
 ### 修复
 
+- 只有 `serve` 启动时才结算旧进程遗留的活跃任务。管理命令可以与服务共用数据库，
+  运行中的任务能照常完成并保存产物。
+- 启动检查和认证中间件使用归一化后的 Bearer token。纯空白值按未配置处理。
+- 出网连接直接使用校验过的解析地址。DNS 解析和拨号共用连接超时，HTTPS 继续校验原域名。
 - **`dsh-cli` 失败时只报 `turn_end reason=error`，把真实原因整个丢掉**
   DSH 在 `turn_end` 事件里其实已经把原因写在 `reason.error` 下：
 
@@ -24,6 +30,10 @@
   现在 error 会带上错误码与说明，并逐行补上 stderr 中 message 没覆盖的部分
   （`dsh: CODE: ` 前缀会先剥掉再比对，避免同一句话被贴两遍）；`metadata` 增加
   `turnEndErrorCode`。回归测试见 `tests/test_dsh_error_detail.py`。
+
+### 升级
+
+从 v0.2.0 升级时沿用 SQLite schema v2。Windows 免安装版继续支持目录版和单文件版。
 
 ## [0.2.0] — 2026-10-13
 

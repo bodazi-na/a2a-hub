@@ -1,6 +1,6 @@
 [project]
 name = "a2a-hub"
-version = "0.2.0"
+version = "0.2.1"
 description = "多 Agent A2A 协调内核：注册发现、能力路由、持久化、编排与审计"
 readme = "README.md"
 license = { file = "LICENSE" }

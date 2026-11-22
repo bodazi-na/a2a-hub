@@ -56,9 +56,10 @@ from a2a_hub.core.parallelism import analyze
 from a2a_hub.core.registry import Registry
 from a2a_hub.core.router import NoRouteError, Router
 from a2a_hub.core.store import Store, new_id
+from a2a_hub import __version__
 
 HUB_NAME = "a2a-hub"
-HUB_VERSION = "0.2.0"
+HUB_VERSION = __version__
 HUB_DESCRIPTION = "多 Agent A2A 协调内核：注册、路由、持久化"
 
 # 内部小写状态 → A2A 协议状态

@@ -49,12 +49,14 @@ hub 的全部既有用法（`127.0.0.1:9100/9101` 的本地桥、本机 mock）�
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from httpcore import ConnectError, ConnectTimeout
 
 __all__ = [
     "NetworkGuardError",
@@ -303,66 +305,32 @@ def check_url(url: str, *, policy: "TargetPolicy | None" = None) -> None:
         )
 
 
-def resolve_and_check(host: str, policy: "TargetPolicy") -> None:
-    """把主机名解析成 IP，逐个过护栏；任一个落在受限段就拒绝。
-
-    **为什么必须自己做这一步**（实测才发现）：
-
-    我原以为「连接层的 host 参数就是解析后的 IP」—— **不是**。
-    `httpcore` 把域名原样交给后端，解析发生在后端内部（`socket.getaddrinfo`
-    之类）。实测：`make_client().get("http://localhost:9/")` 时护栏后端收到的
-    `host` 参数是字符串 `'localhost'`，不是 `127.0.0.1`。而
-    `is_blocked_host('localhost')` 对域名一律返回 None（判定推迟），
-    于是**一个解析到 10.0.0.5 的域名会畅通无阻** —— 正是 DNS rebinding
-    那类最需要拦的情形，防护形同虚设。
-
-    所以判定必须显式做「解析 → 对每个结果过护栏」。**常见做法是只查第一个
-    地址，这里刻意查全部**：一个域名可以同时解析出公网与内网地址，
-    只查第一个等于给攻击者留一个「把内网地址排在后面」的机会。
-
-    维修记录：本函数第一版把「IP 字面量已被拒」写成了 `return`（当成放行），
-    等于**把该拦的 IP 字面量静默放过**。当时因为 `check_url()` 的静态预检在更
-    早一步已经拦下 IP 字面量，这个错被完全遮住 —— 而连接层这条路（刚为了
-    防 rebinding 加的）会直接放行 `10.0.0.5`。**同一事实有两条通路，就要问
-    它们会不会不一致**：这里正是「入口拦住了、连接层没拦」。
-    """
-    literal = _strip_brackets(host.strip())
-    if literal:
-        try:
-            ipaddress.ip_address(literal)
-        except ValueError:
-            pass            # 不是 IP 字面量 → 走下面的解析判断
-        else:
-            # 是 IP 字面量：判定结果就是最终结论，没有「解析」这一步。
-            # **被拒必须抛**（这正是上面那条维修记录修的地方）。
-            reason = policy.rejects(ipaddress.ip_address(literal))
-            if reason:
-                raise NetworkGuardError(
-                    f"网络护栏拦截：拒绝连接 {literal}（{reason}）。"
-                    "该目标属于本机/内网地址，hub 只应访问可信的下游 agent。\n"
-                    "      若这是可信的内部服务，请用 --allow-local-targets 显式放行。"
-                )
-            return          # 回环等已放行的字面量
-
-    if not literal:
-        return
+def resolve_and_check(host: str, policy: "TargetPolicy") -> tuple[str, ...]:
+    """返回本次拨号可用的数字 IP。任一解析结果违反策略时拒绝整个目标。"""
+    host = _strip_brackets(host.strip())
+    if not host:
+        raise ConnectError("网络护栏：连接目标缺少主机名")
     try:
-        infos = socket.getaddrinfo(literal, None, proto=socket.IPPROTO_TCP)
-    except OSError:
-        # 解析不了：连都连不上，交给 socket 层去报错。
-        # 这里**不**当作拒绝 —— 与 `_is_loopback`（宁可误拒）方向相反，
-        # 这个函数服务于「正常请求要能过」，不解析就拒会让 DNS 抖动变成故障。
-        return
+        addresses = (ipaddress.ip_address(host),)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(
+                host, None, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP,
+            )
+        except OSError as exc:
+            raise ConnectError(f"无法解析 {host}：{exc}") from exc
+        addresses = tuple(ipaddress.ip_address(info[4][0]) for info in infos)
+    if not addresses:
+        raise ConnectError(f"无法解析 {host}：没有返回 IP 地址")
 
-    for info in infos:
-        addr = info[4][0]
-        reason = is_blocked_ip(addr, policy=policy)
+    for addr in addresses:
+        reason = policy.rejects(addr)
         if reason:
             raise NetworkGuardError(
-                f"网络护栏拦截：{literal} 解析到 {addr}（{reason}）。"
-                "域名不应指向本机/内网地址 —— 这类写法常被用来绕过入口检查。\n"
-                "      若这是可信的内部服务，请用 --allow-local-targets 显式放行。"
+                f"网络护栏拦截：拒绝连接 {host} 的目标地址 {addr}（{reason}）。\n"
+                "      若这是可信的私网服务，请用 --allow-local-targets 显式放行。"
             )
+    return tuple(dict.fromkeys(str(addr) for addr in addresses))
 
 
 class _GuardedNetworkBackend:
@@ -387,15 +355,6 @@ class _GuardedNetworkBackend:
     def __init__(self, inner: Any, policy: "TargetPolicy") -> None:
         self._inner = inner
         self._policy = policy
-        # 惰性构造：真正的后端每个事件循环只能有一个，必须在循环里建。
-        self._backend: Any = None
-
-    def _real_backend(self) -> Any:
-        if self._backend is None:
-            from httpcore._backends.auto import AutoBackend
-
-            self._backend = AutoBackend()
-        return self._backend
 
     async def connect_tcp(
         self,
@@ -405,21 +364,38 @@ class _GuardedNetworkBackend:
         local_address: str | None = None,
         socket_options: Any = None,
     ) -> Any:
-        # host 可能是 IP 字面量、也可能是**没解析过的域名** ——
-        # 后者必须自己解析后逐个判定，见 resolve_and_check 的说明。
-        resolve_and_check(host, self._policy)
-        return await self._real_backend().connect_tcp(
-            host, port, timeout=timeout,
-            local_address=local_address, socket_options=socket_options,
-        )
+        # DNS 与所有候选地址共用连接超时。TLS 仍由 httpcore 按原 URL 主机名处理。
+        try:
+            return await asyncio.wait_for(
+                self._connect_checked(host, port, timeout, local_address, socket_options),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ConnectTimeout(f"连接 {host} 超时") from exc
+
+    async def _connect_checked(
+        self, host: str, port: int, timeout: float | None,
+        local_address: str | None, socket_options: Any,
+    ) -> Any:
+        addresses = await asyncio.to_thread(resolve_and_check, host, self._policy)
+        for index, address in enumerate(addresses, start=1):
+            try:
+                # 传入数字 IP，确保后端拨的是刚校验过的地址。
+                return await self._inner.connect_tcp(
+                    address, port, timeout=timeout,
+                    local_address=local_address, socket_options=socket_options,
+                )
+            except (ConnectError, ConnectTimeout):
+                if index == len(addresses):
+                    raise
 
     async def connect_unix_socket(self, *args: Any, **kwargs: Any) -> Any:
         # Unix socket 不走网络，但也不该由「下游指定的地址」触发 —— 原样透传，
         # 交由 httpcore 处理（hub 目前不使用该路径）。
-        return await self._real_backend().connect_unix_socket(*args, **kwargs)
+        return await self._inner.connect_unix_socket(*args, **kwargs)
 
     async def sleep(self, seconds: float) -> None:
-        return await self._real_backend().sleep(seconds)
+        return await self._inner.sleep(seconds)
 
 
 class GuardedTransport(httpx.AsyncHTTPTransport):
@@ -434,7 +410,7 @@ class GuardedTransport(httpx.AsyncHTTPTransport):
         super().__init__(**kwargs)
         self.policy = policy or TargetPolicy()
         # `_pool` 是 httpx 的 httpcore 连接池；它的后端决定「怎么拨号」。
-        # 这里做一次替换，其余行为（连接复用、TLS、超时）全部不变。
+        # 只替换拨号后端，连接复用与 TLS 仍由 httpcore 处理。
         try:
             self._pool._network_backend = _GuardedNetworkBackend(  # noqa: SLF001
                 self._pool._network_backend, self.policy,   # noqa: SLF001

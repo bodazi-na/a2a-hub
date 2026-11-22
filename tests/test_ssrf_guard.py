@@ -35,6 +35,10 @@ import asyncio
 import os
 import socket
 import sys
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+from httpcore import ConnectError
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "src"))
@@ -410,6 +414,54 @@ def test_resolve_then_check() -> list:
     return out
 
 
+def test_dials_checked_addresses() -> list:
+    """假 DNS 和假 TCP 后端验证地址回退与 HTTPS 主机名。"""
+    print("\n[拨号] 使用已校验的数字地址，保留 HTTPS 主机名")
+
+    async def run():
+        stream = Mock()
+        stream.start_tls = AsyncMock(return_value=stream)
+        stream.get_extra_info.return_value = None
+        stream.write = AsyncMock()
+        stream.read = AsyncMock(
+            return_value=b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        stream.aclose = AsyncMock()
+        backend = Mock()
+        backend.connect_tcp = AsyncMock(side_effect=[ConnectError("无法连接"), stream])
+        transport = GuardedTransport()
+        transport._pool._network_backend._inner = backend
+        records = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+        ]
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with patch.object(socket, "getaddrinfo", return_value=records) as resolve:
+                response = await client.get("https://agent.example.com/")
+            attempts = [call.args[:2] for call in backend.connect_tcp.call_args_list]
+            out = [
+                check("DNS 只解析一次", resolve.call_count == 1),
+                check("只拨已校验的 IPv6、IPv4 地址",
+                      attempts == [("::1", 443), ("127.0.0.1", 443)]),
+                check("HTTPS 保留 URL 主机名并正常返回",
+                      response.status_code == 200 and
+                      stream.start_tls.call_args.kwargs["server_hostname"] == "agent.example.com"),
+            ]
+            backend.connect_tcp.reset_mock()
+            with patch.object(socket, "getaddrinfo", side_effect=socket.gaierror()):
+                try:
+                    await client.get("https://agent.example.com/")
+                except httpx.ConnectError:
+                    dns_failed = True
+                else:
+                    dns_failed = False
+            out.append(check("解析失败时不拨号", dns_failed and not backend.connect_tcp.called))
+            return out
+
+    return asyncio.run(run())
+
+
 CASES = [
     ("必须拦的目标", test_must_block),
     ("必须放行的目标", test_must_allow),
@@ -418,6 +470,7 @@ CASES = [
     ("连接层拦截", test_transport_blocks),
     ("护栏装配", test_transport_installs_guard),
     ("解析后判定", test_resolve_then_check),
+    ("拨号使用已核验地址", test_dials_checked_addresses),
     ("卡片端点不采信", test_card_declared_endpoint),
     ("_rpc 直连被拦", test_rpc_call_blocked),
 ]

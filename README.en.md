@@ -9,7 +9,7 @@ and **is itself a standard A2A agent**, so any A2A-speaking client can call it.
 
 **English** · [中文](README.md)
 
-**Current release** [v0.2.1 pre-release](https://github.com/bodazi-na/a2a-hub/releases/tag/v0.2.1)
+**Current release** [v0.2.2 pre-release](https://github.com/bodazi-na/a2a-hub/releases/tag/v0.2.2)
 
 ---
 
@@ -54,9 +54,7 @@ with the reason recorded.
 
 ## Downloads and upgrades
 
-v0.2.1 fixes management commands that marked live tasks as interrupted, authentication
-checks for whitespace-only tokens, and outbound address validation. It also preserves
-error codes and details from `dsh-cli`. See the [changelog](CHANGELOG.md#021--2026-11-22).
+v0.2.2 fixes task recovery, plan session isolation, cancellation and result persistence. Stop the previous Hub before upgrading. See the [changelog](CHANGELOG.md#022--2026-11-24).
 
 On Windows x64, download the ZIP from the release page, extract it, and double-click
 `start-hub.bat`. The release also includes the standalone `a2a-hub.exe` and

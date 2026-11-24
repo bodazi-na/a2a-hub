@@ -6,7 +6,7 @@
 
 **中文** · [English](README.en.md)
 
-**当前版本** [v0.2.1 预发布](https://github.com/bodazi-na/a2a-hub/releases/tag/v0.2.1)
+**当前版本** [v0.2.2 预发布](https://github.com/bodazi-na/a2a-hub/releases/tag/v0.2.2)
 
 ---
 
@@ -45,8 +45,7 @@
 
 ## 下载与升级
 
-v0.2.1 修复了管理命令误结算运行中任务、空白 token 的启动检查和出网地址校验，并补全了
-`dsh-cli` 返回的错误码与失败原因。完整记录见 [CHANGELOG.md](CHANGELOG.md#021--2026-11-22)。
+v0.2.2 修复了重复启动时的任务恢复、计划会话隔离、取消和产物落库。升级前请先停止旧版 Hub。详见 [变更记录](CHANGELOG.md#022--2026-11-24)。
 
 Windows x64 用户可在发布页下载目录版 ZIP，解压后双击 `start-hub.bat`。发布页同时提供
 单文件 `a2a-hub.exe` 和 `SHA256SUMS.txt`。

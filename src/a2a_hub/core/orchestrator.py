@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,6 +48,28 @@ class PlanError(ValueError):
     """plan 本身有问题（循环依赖、引用不存在的 step 等）。"""
 
 
+def parse_timeout(raw: Any, *, default: float | None = None) -> float | None:
+    """解析并校验 timeout；未提供时返回 `default`（通常是 None）。
+
+    **必须返回 None 而不是替调用方填一个数**（A2A-13）：
+    Hub 若统一填 600，适配器里 `timeout or self.default_timeout` 就永远取 600，
+    `agents/*.json` 里配的 timeout 等于白写。语义应该是
+    「未指定 → 由适配器决定」。
+
+    校验必须在**落库之前**做：参数非法时直接报错，不能让一个没人执行的任务
+    留在 submitted 状态（A2A-10）。
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"timeout 必须是数字，收到: {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"timeout 必须是正的有限值，收到: {value!r}")
+    return min(value, 24 * 3600.0)
+
+
 @dataclass
 class Step:
     id: str
@@ -55,7 +78,7 @@ class Step:
     tags: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
     on_error: str = ON_ERROR_FAIL
-    timeout: float = 600.0
+    timeout: float | None = None
     # 是否与同 plan 的其他 step 共享下游会话上下文。
     # **默认 False**：step 之间靠模板变量显式传数据，不该靠共享会话隐式串味 ——
     # 共享会让并行扇出退化成串行（A2A-04 的锁按 (contextId, agent) 串行化），
@@ -78,7 +101,7 @@ class Step:
             tags=list(raw.get("tags") or []),
             depends_on=[str(d) for d in (raw.get("dependsOn") or raw.get("depends_on") or [])],
             on_error=on_error,
-            timeout=float(raw.get("timeout") or 600.0),
+            timeout=parse_timeout(raw.get("timeout")),
             shared_context=bool(raw.get("sharedContext") or raw.get("shared_context") or False),
         )
 
@@ -215,18 +238,13 @@ class Orchestrator:
         # 先把**全部步骤**落库为占位任务（A2A-07）。
         # 否则被跳过 / 未执行的 step 在库里毫无痕迹，GetPlan 无法重建完整计划 ——
         # 审计要能回答「这次编排原本打算做什么」，而不只是「实际做了什么」。
-        placeholders: dict[str, str] = {}
-        for step in steps:
-            task = self.hub.store.create_task(
-                context_id=context_id,
-                prompt=step.prompt,
-                state="submitted",
-                trace_id=trace_id,
-                plan_id=plan_id,
-                step_id=step.id,
-                metadata={"planned": True, "requestedAgent": step.agent},
-            )
-            placeholders[step.id] = task["id"]
+        context_id = context_id or f"ctx-{uuid.uuid4().hex}"
+        placeholders = self.hub.store.create_plan_tasks(plan_id, [
+            dict(context_id=context_id if step.shared_context else f"{context_id}::{step.id}",
+                 prompt=step.prompt, trace_id=trace_id, step_id=step.id,
+                 metadata={"planned": True, "requestedAgent": step.agent})
+            for step in steps
+        ])
 
         # 逐层执行。整段包在 try/finally 里：**无论正常结束、上游中止还是被取消，
         # 未执行的 step 都必须结算** —— 否则它们会永远停在 submitted，
@@ -245,17 +263,10 @@ class Orchestrator:
                         if d not in results or not results[d].ok
                     ]
                     if failed_deps:
-                        if step.on_error == ON_ERROR_CONTINUE:
-                            results[sid] = StepResult(
-                                id=sid, ok=False, skipped=True,
-                                error=f"依赖失败被跳过: {failed_deps}",
-                            )
-                            continue
-                        results[sid] = StepResult(
-                            id=sid, ok=False, error=f"依赖失败: {failed_deps}"
+                        results[sid] = self._skip_step(
+                            sid, placeholders[sid], f"依赖失败被跳过: {failed_deps}"
                         )
-                        aborted = True
-                        break
+                        continue
                     runnable.append(step)
 
                 if aborted or not runnable:
@@ -312,11 +323,11 @@ class Orchestrator:
         for sid in by_id:
             if sid in results:
                 continue
-            results[sid] = StepResult(id=sid, ok=False, skipped=True, error=reason)
-            self.hub.store.update_task(
-                placeholders[sid], state="canceled", error=reason,
-                finished=True, only_from=("submitted", "working"),
-            )
+            results[sid] = self._skip_step(sid, placeholders[sid], reason)
+
+    def _skip_step(self, sid: str, task_id: str, reason: str) -> StepResult:
+        self.hub.cancel_pending(task_id, reason)
+        return StepResult(id=sid, task_id=task_id, ok=False, skipped=True, error=reason)
 
     async def _run_step(self, step: Step, plan_id: str, context_id: str,
                         plan_input: str, results: dict[str, StepResult],

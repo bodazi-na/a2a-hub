@@ -503,6 +503,9 @@ class CLIAdapter(Adapter):
 
         return CallResult(
             ok=outcome.ok,
+            session_invalid=outcome.metadata.get("turnEndErrorCode") in (
+                "SESSION_NOT_FOUND", "SESSION_EXPIRED",
+            ),
             text=outcome.text,
             session_id=outcome.session_id,
             events=events,

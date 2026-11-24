@@ -304,6 +304,19 @@ class Store:
         )
         return self.get_task(task_id)  # type: ignore[return-value]
 
+    def create_plan_tasks(self, plan_id: str, steps: list[dict]) -> dict[str, str]:
+        """Reserve the plan ID and insert every placeholder in one write transaction."""
+        def work():
+            if self._conn.execute(
+                "SELECT 1 FROM tasks WHERE plan_id = ? LIMIT 1", (plan_id,)
+            ).fetchone():
+                raise ValueError(f"planId 已存在: {plan_id}")
+            return {
+                step["step_id"]: self.create_task(plan_id=plan_id, **step)["id"]
+                for step in steps
+            }
+        return self._write_txn(work)
+
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -351,6 +364,7 @@ class Store:
         metadata: dict[str, Any] | None = None,
         started: bool = False,
         finished: bool = False,
+        response_artifact: dict[str, Any] | None = None,
         only_from: tuple[str, ...] | None = None,
     ) -> dict[str, Any] | None:
         """更新任务。
@@ -402,6 +416,8 @@ class Store:
                 f"UPDATE tasks SET {', '.join(sets)} WHERE {where}", args
             )
             updated = cursor.rowcount > 0
+            if updated and response_artifact is not None:
+                self.add_artifact(task_id, **response_artifact)
             row = self._conn.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()

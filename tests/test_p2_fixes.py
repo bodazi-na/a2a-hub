@@ -239,9 +239,9 @@ async def test_a2a_09_cli_recovery_boundary() -> bool:
             nonlocal old_task_at_start
             old_task_at_start = hub.store.get_task(old_id)
 
-        with patch("uvicorn.run", side_effect=start_app):
+        with patch("uvicorn.Server.run", side_effect=start_app):
             hub_cli.cmd_serve(argparse.Namespace(
-                db=db, token=None, host="127.0.0.1", port=9200, allow_insecure=False,
+                db=db, token=None, host="127.0.0.1", port=0, allow_insecure=False,
             ))
         recovered = (
             old_task_at_start is not None

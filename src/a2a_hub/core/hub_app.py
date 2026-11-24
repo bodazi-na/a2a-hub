@@ -36,7 +36,6 @@ import asyncio
 import hmac
 import inspect
 import json
-import math
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -51,7 +50,7 @@ from starlette.routing import Route
 
 from a2a_hub.adapters.base import Adapter
 from a2a_hub.core.netguard import TargetPolicy
-from a2a_hub.core.orchestrator import Orchestrator, PlanError
+from a2a_hub.core.orchestrator import Orchestrator, PlanError, parse_timeout
 from a2a_hub.core.parallelism import analyze
 from a2a_hub.core.registry import Registry
 from a2a_hub.core.router import NoRouteError, Router
@@ -222,28 +221,6 @@ def clamp_limit(raw: Any, *, default: int = 50, maximum: int = 500) -> int:
     if value <= 0:
         return default
     return min(value, maximum)
-
-
-def parse_timeout(raw: Any, *, default: float | None = None) -> float | None:
-    """解析并校验 timeout；未提供时返回 `default`（通常是 None）。
-
-    **必须返回 None 而不是替调用方填一个数**（A2A-13）：
-    Hub 若统一填 600，适配器里 `timeout or self.default_timeout` 就永远取 600，
-    `agents/*.json` 里配的 timeout 等于白写。语义应该是
-    「未指定 → 由适配器决定」。
-
-    校验必须在**落库之前**做：参数非法时直接报错，不能让一个没人执行的任务
-    留在 submitted 状态（A2A-10）。
-    """
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"timeout 必须是数字，收到: {raw!r}") from None
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"timeout 必须是正的有限值，收到: {value!r}")
-    return min(value, 24 * 3600.0)
 
 
 async def _safe_close(adapter: Adapter) -> None:
@@ -779,6 +756,8 @@ class Hub:
                 )
         try:
             result = await handler(params)
+        except ValueError as exc:
+            return self._rpc_error(req_id, -32602, str(exc))
         except NoRouteError as exc:
             return self._rpc_error(req_id, -32001, f"No route: {exc}")
         except LookupError as exc:
@@ -1035,6 +1014,10 @@ class Hub:
         """
         existing = self.store.get_task(task_id) if task_id else None
         if existing is not None:
+            if existing["state"] not in ACTIVE_STATES:
+                self.store.add_message(task_id, role="agent", kind="status",
+                                       content=[{"text": f"skipped: 任务已进入终态 {existing['state']}"}])
+                return self._task_payload(task_id)
             # 复用编排层预落的占位任务：它的 metadata 里只有 planned/requestedAgent，
             # 这里补上 planId / stepId，否则 ListTasks 查不到编排归属（审计会缺线索）
             task = existing
@@ -1064,16 +1047,15 @@ class Hub:
 
         try:
             record = self.router.route(agent=agent, tags=tags or [])
+            adapter = self._get_adapter(record)
+            if adapter is None:
+                raise NoRouteError(f"agent {record.name} 的 kind={record.kind} 暂无可用的适配器实现")
         except NoRouteError as exc:
-            self.store.add_message(task_id, role="agent", kind="error",
-                                   content=[{"text": str(exc)}])
-            self.store.update_task(task_id, state="failed", error=str(exc), finished=True)
-            return self._task_payload(task_id)
-
-        adapter = self._get_adapter(record)
-        if adapter is None:
-            err = f"agent {record.name} 的 kind={record.kind} 暂无可用的适配器实现"
-            self.store.update_task(task_id, state="failed", error=err, finished=True)
+            settled = self.store.update_task(task_id, state="failed", error=str(exc),
+                                             finished=True, only_from=ACTIVE_STATES)
+            if settled and settled["_updated"]:
+                self.store.add_message(task_id, role="agent", kind="error", content=[{"text": str(exc)}])
+                self._publish(task_id, {"terminal": True, "state": "failed"})
             return self._task_payload(task_id)
 
         session_id = (
@@ -1194,17 +1176,9 @@ class Hub:
                     timeout=timeout,
                     **stream_kwargs,
                 )
-                # 续接失败要能自愈。
-                #
-                # 下游的 session 可能已经不存在了（它自己重启、被清理、换了 cwd）。
-                # 此时下游往往只回「退出码非 0」且**没有任何输出**，从错误里根本
-                # 看不出原因；更糟的是这条死映射会被**永久保留** —— 于是这个
-                # contextId 之后每次调用都失败，等于把它彻底弄坏了。
-                #
-                # 处理：清掉映射、不带 session 重试一次。三个条件都满足才做 ——
-                # 用了 session 续接、不是超时、还没重试过。超时说明下游确实跑了
-                # 那么久，重试等于把开销翻倍。
-                if context_id and session_id and not result.ok and not result.timed_out:
+                # Only an explicit session rejection is safe to replay.
+                if (context_id and session_id and not result.ok and not result.timed_out
+                        and result.session_invalid):
                     self.store.add_message(
                         task_id, role="agent", kind="status",
                         content=[{"text": (
@@ -1276,33 +1250,7 @@ class Hub:
                 lock.release()
 
     async def _settle_result(self, task_id: str, record, result: Any) -> None:
-        """落终态与产物。
-
-        **顺序是有意的**：先抢终态（由 `only_from` 裁决谁说了算），抢到了才写产物。
-        反过来会留下「任务已被取消、却带着完整 response artifact」的矛盾记录 ——
-        那是「假成功」的另一种形态，调用方会以为活干完了（P2-9）。
-
-        代价是：若产物写入失败，会出现「completed 但没有 artifact」。
-        这种情况由调用方的 except 分支记一条 error 消息，至少不会静默 ——
-        而「已取消却有交付物」是会误导决策的假象，两者不可兼得时选前者。
-        """
-        final = self.store.update_task(
-            task_id,
-            state="completed" if result.ok else "failed",
-            error=None if result.ok else (result.error or "unknown failure"),
-            finished=True,
-            only_from=ACTIVE_STATES,
-        )
-        if not (final or {}).get("_updated"):
-            self.store.add_message(
-                task_id, role="agent", kind="status",
-                content=[{"text": (
-                    f"discarded: 任务已由其它路径结算为 "
-                    f"{(final or {}).get('state')}，本次结果不落库"
-                )}],
-            )
-            return
-
+        """Persist execution events, then commit the terminal state and output together."""
         # 过程事件**一次事务写完**，不要逐条 —— 逐条时每次 COMMIT 都要 fsync，
         # 50 个事件实测把事件循环硬阻塞 193ms，这期间连 CancelTask 都调度不了（M2）。
         # 合成一个事务后 0.9ms。
@@ -1329,9 +1277,10 @@ class Hub:
                     for event in rest
                 ])
 
+        artifact = None
         if result.ok:
-            self.store.add_artifact(
-                task_id, name="response",
+            artifact = dict(
+                name="response",
                 content=[{"text": result.text}],
                 metadata={
                     **(result.metadata or {}),
@@ -1340,10 +1289,22 @@ class Hub:
                     "agent": record.name,
                 },
             )
-        else:
-            self.store.update_task(task_id, state="failed",
-                                   error=result.error or "unknown failure",
-                                   finished=True, only_from=ACTIVE_STATES)
+        final = self.store.update_task(
+            task_id,
+            state="completed" if result.ok else "failed",
+            error=None if result.ok else (result.error or "unknown failure"),
+            finished=True,
+            only_from=ACTIVE_STATES, response_artifact=artifact,
+        )
+        if not (final or {}).get("_updated"):
+            self.store.add_message(
+                task_id, role="agent", kind="status",
+                content=[{"text": (
+                    f"discarded: 任务已由其它路径结算为 "
+                    f"{(final or {}).get('state')}，本次结果不落库"
+                )}],
+            )
+            return
 
         # 终态推给订阅者。**放在最后** —— 订阅者收到它就知道流该结束了，
         # 所以必须等产物也落完，否则客户端拿到 task 时 artifact 还没写进去。
@@ -1550,14 +1511,15 @@ class Hub:
         # 任务若恰好在此期间跑完，就会往一个 completed 任务上追加「已取消」消息
         # 而状态没变，审计自相矛盾（P2-7）。这条 UPDATE 的 WHERE 本身
         # 就完成了「是不是活跃态」的判断，不需要再先 get_task 一次。
-        settled = self.store.update_task(
-            task_id, state="canceled", error="canceled: no active worker",
-            finished=True, only_from=ACTIVE_STATES,
-        )
-        if (settled or {}).get("_updated"):
-            self.store.add_message(task_id, role="agent", kind="status",
-                                   content=[{"text": "canceled (no active worker)"}])
+        self.cancel_pending(task_id, "canceled: no active worker")
         return self._task_payload(task_id)
+
+    def cancel_pending(self, task_id: str, reason: str) -> None:
+        settled = self.store.update_task(task_id, state="canceled", error=reason,
+                                         finished=True, only_from=ACTIVE_STATES)
+        if settled and settled["_updated"]:
+            self.store.add_message(task_id, role="agent", kind="status", content=[{"text": reason}])
+            self._publish(task_id, {"state": "canceled", "terminal": True})
 
     # ------------------------------------------------------------------
     # 健康探测
@@ -1663,7 +1625,7 @@ class Hub:
              "options": {"command": ["...dsh.cmd"], "cwd": "...", "timeout": 300}}
         """
         signature = json.dumps(
-            {"kind": record.kind, "endpoint": record.endpoint, "config": record.config},
+            {"kind": record.kind, "endpoint": record.endpoint, "config": record.config, "card": record.card},
             sort_keys=True, ensure_ascii=False, default=str,
         )
         cached = self._adapters.get(record.name)
@@ -1677,6 +1639,7 @@ class Hub:
 
             adapter = A2AHttpAdapter(record.name, record.endpoint,
                                      policy=self.target_policy)
+            adapter.apply_card(record.card)
 
         elif record.kind == "cli":
             from a2a_hub.adapters import cli as cli_mod

@@ -85,6 +85,7 @@ class CallResult:
     # 而「续接的 session 已失效」这类失败通常**秒级**返回，重试是划算的。
     timed_out: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+    session_invalid: bool = False
 
 
 # ---------------------------------------------------------------------------

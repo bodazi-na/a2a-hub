@@ -186,14 +186,11 @@ async def test_settlement_failure_still_settles() -> bool:
     result = await hub.dispatch_task("go", agent="spy")
     tid = result["id"]
     task = store.get_task(tid)
-    msgs = store.list_messages(tid)
-    noted = any("结算阶段出错" in (m.get("content") or [{}])[0].get("text", "")
-                for m in msgs)
-
     print(f"  终态: {task['state']}（adapter 调用 {spy.calls} 次）")
     return report({
-        "任务没有停在活跃态（M4b 核心）": task["state"] not in ("submitted", "working"),
-        "失败没有被静默吞掉（留下了 error 消息）": noted,
+        "任务没有停在活跃态（M4b 核心）": task["state"] == "failed",
+        "落库错误可追溯": "模拟落库失败" in task["error"],
+        "没有残留产物": not store.list_artifacts(tid),
     })
 
 

@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
+import socket
 import shutil
 
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -32,8 +35,6 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "packaging" / "hub.spec"
 DEFAULT_DIST = ROOT / "dist"
 
-# 实测启动时用的端口。避开默认 9200，免得撞上正在跑的开发实例。
-PROBE_PORT = 19280
 # 冒烟检查最多等多久（秒）。超了就判失败并打印进程输出 —— **必须有上界**，
 # 否则一个起不来的 exe 会把构建无限挂住。
 PROBE_TIMEOUT_SECONDS = 30
@@ -147,52 +148,64 @@ def smoke(target: Path) -> dict:
 
 def _run_probe(exe: Path) -> dict:
     print(f"  实测启动 {exe.name} …")
-    t0 = time.time()
-    proc = subprocess.Popen(
-        [str(exe), "serve", "--host", "127.0.0.1", "--port", str(PROBE_PORT)],
-        cwd=str(exe.parent), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    if str(ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(ROOT / "src"))
+    from a2a_hub.adapters.cli import _JobObject
+
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    token = secrets.token_urlsafe(32)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    admin = urllib.request.Request(base + "/admin/agents",
+                                   headers={"Authorization": f"Bearer {token}"})
+    # The launcher waits until it belongs to the job before spawning the onefile bootstrap.
+    launcher = ("import subprocess, sys; "
+                "sys.exit(subprocess.call(sys.argv[1:]) if sys.stdin.buffer.read(1) else 1)")
     ready_at = None
     body = None
-    output = ""
-    try:
-        for _ in range(PROBE_TIMEOUT_SECONDS * 4):    # 每轮 0.25s
-            time.sleep(0.25)
-            if proc.poll() is not None:
-                break
-            try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{PROBE_PORT}/healthz", timeout=2
-                ) as resp:
-                    body = resp.read().decode("utf-8")
-                    ready_at = time.time() - t0
-                    break
-            except Exception:                      # noqa: BLE001
-                continue
-    finally:
-        proc.terminate()
+    start = time.monotonic()
+    with tempfile.TemporaryFile() as log:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", launcher, str(exe), "serve", "--host", "127.0.0.1",
+             "--port", str(port)], cwd=exe.parent, stdin=subprocess.PIPE,
+            stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "HUB_TOKEN": token},
+        )
+        job = _JobObject(proc.pid)
         try:
+            if not job.ok:
+                raise RuntimeError("无法为冒烟测试创建 Windows Job Object")
+            proc.stdin.write(b"1")
+            proc.stdin.close()
+            while proc.poll() is None and time.monotonic() - start < PROBE_TIMEOUT_SECONDS:
+                try:
+                    # Require this instance's secret and reject an unprotected stale server.
+                    try:
+                        with opener.open(base + "/admin/agents", timeout=1):
+                            raise RuntimeError("冒烟端口存在其他服务")
+                    except urllib.error.HTTPError as exc:
+                        if exc.code != 401:
+                            raise
+                    with opener.open(admin, timeout=1), opener.open(base + "/healthz", timeout=1) as resp:
+                        body = resp.read().decode("utf-8")
+                    ready_at = time.monotonic() - start
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        finally:
+            if not proc.stdin.closed:
+                proc.stdin.close()
+            job.close()
             proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-        # **先终止再读输出**。反过来的话，进程还活着时 `read()` 会一直等到
-        # 它退出 —— 健康检查失败（进程其实在正常服务、只是接口没通）时就是
-        # 「无限等待」，冒烟检查反倒把整个构建挂住。实测踩到过。
-        if ready_at is None and proc.stdout is not None:
-            try:
-                output = proc.stdout.read() or ""
-            except Exception:                      # noqa: BLE001
-                pass
-        # 刚终止的进程还握着 SQLite 文件句柄，Windows 释放要一点点时间。
-        # 不睡这一下，临时目录清理会报 WinError 32（文件被占用）。
-        time.sleep(0.5)
-    return {"readySeconds": ready_at, "health": body,
-            "exitCode": proc.returncode, "output": output}
+        log.seek(0)
+        output = log.read().decode("utf-8", errors="replace")
+    if ready_at is not None:
+        with socket.socket() as check:
+            check.settimeout(1)
+            if check.connect_ex(("127.0.0.1", port)) == 0:
+                raise RuntimeError("冒烟测试结束后服务端口仍被占用")
+    return {"readySeconds": ready_at, "health": body, "exitCode": proc.returncode, "output": output}
 
 
 def main() -> int:
@@ -221,7 +234,7 @@ def main() -> int:
             print(f"  ✓ 启动成功，{s['readySeconds']:.2f}s 后 /healthz 就绪")
             print(f"    {s['health']}")
         else:
-            print(f"  ✗ 启动失败（退出码 {s['exitCode']}）")
+            print(f"  ✗ 启动失败（退出码 {s['exitCode']}）\n{s['output'][-2000:]}")
 
     print("\n==== 对比 ====")
     print(f"  {'形态':<8}{'体积':>10}{'文件数':>8}{'启动就绪':>10}  结果")

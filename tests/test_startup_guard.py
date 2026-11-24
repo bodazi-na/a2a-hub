@@ -141,7 +141,7 @@ def test_whitespace_token_is_not_auth() -> list:
         with (
             patch.dict(os.environ, {"HUB_TOKEN": env_token}),
             patch.object(cli, "build_hub") as build,
-            patch("uvicorn.run") as run,
+            patch("uvicorn.Server.run") as run,
         ):
             exit_code = None
             try:

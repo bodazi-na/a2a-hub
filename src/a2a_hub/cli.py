@@ -25,6 +25,8 @@ import ipaddress
 import json
 import os
 import sys
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 
@@ -133,15 +135,11 @@ def build_hub(db_path: Path, *, auth_token: str | None = None,
     store = Store(db_path)
     registry = Registry(store)
     router = Router(registry)
-    adapters = {}
-    for rec in registry.list(enabled_only=False):
-        if rec.kind == "a2a_http" and rec.endpoint:
-            adapters[rec.name] = _build_adapter(rec.name, rec.endpoint, policy)
     # 下游 agent 的工作目录**必须显式传**，不能用 Hub 的默认值（`Path.cwd()`）：
     # 双击 exe 时 cwd 是「当时碰巧在哪」，可能是桌面、也可能是 C:\Windows\System32，
     # 于是 workspace/ 就散落在那种地方。这里用 ROOT —— 它已经做了 frozen 判断，
     # 源码运行时是仓库根、打包后是 exe 所在目录，两种形态行为一致。
-    return Hub(store, registry, router, adapters, auth_token=auth_token,
+    return Hub(store, registry, router, {}, auth_token=auth_token,
                workspace_dir=str(ROOT / "workspace"), target_policy=policy)
 
 
@@ -210,25 +208,38 @@ def cmd_serve(args: argparse.Namespace) -> None:
         )
         raise SystemExit(2)
 
-    hub = build_hub(Path(args.db), auth_token=token,
-                    target_policy=_target_policy(args))
-    # 管理命令也会打开同一数据库，只有服务启动时才结算旧进程的活跃任务（A2A-09）。
-    orphans = hub.recover_orphans()
-    if orphans:
-        print(f"[hub] 已结算 {orphans} 个失去 worker 的孤儿任务（标记为 interrupted）")
-    names = [a.name for a in hub.registry.list(enabled_only=False)]
-    # URL 里的 IPv6 要带方括号（`http://::1:9200` 是无效写法），
-    # 而绑定时**不能**带 —— 所以展示用带括号的，绑定用归一化后的。
-    shown = f"[{host}]" if ":" in host else host
-    print(f"[hub] db      = {args.db}")
-    print(f"[hub] agents  = {names or '(空)'}")
-    print(f"[hub] auth    = {'Bearer 已启用' if token else '关闭（仅本机使用）'}")
-    if not _is_loopback(host) and not token:
-        print(f"[hub] !! 警告：服务暴露在 {host} 上且未启用认证（--allow-insecure 豁免）——"
-              "同网段任何人都能派发任务")
-    print(f"[hub] card    = http://{shown}:{args.port}/.well-known/agent-card.json")
-    print(f"[hub] console = http://{shown}:{args.port}/console")
-    uvicorn.run(hub.build_app(), host=host, port=args.port, log_level="info")
+    db = Path(args.db).resolve()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    # A dedicated SQLite lock lets management commands keep reading the task database.
+    with closing(sqlite3.connect(str(db) + ".serve-lock", timeout=0)) as owner:
+        try:
+            owner.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as exc:
+            raise SystemExit(f"无法独占服务数据库 {db}: {exc}") from exc
+        hub = build_hub(db, auth_token=token, target_policy=_target_policy(args))
+        try:
+            config = uvicorn.Config(hub.build_app(), host=host, port=args.port, log_level="info")
+            with config.bind_socket() as listener:
+                listener.listen(config.backlog)
+                orphans = hub.recover_orphans()
+                if orphans:
+                    print(f"[hub] 已结算 {orphans} 个失去 worker 的孤儿任务（标记为 interrupted）")
+                names = [a.name for a in hub.registry.list(enabled_only=False)]
+                # URL 里的 IPv6 要带方括号（`http://::1:9200` 是无效写法），
+                # 而绑定时**不能**带 —— 所以展示用带括号的，绑定用归一化后的。
+                shown = f"[{host}]" if ":" in host else host
+                print(f"[hub] db      = {args.db}")
+                print(f"[hub] agents  = {names or '(空)'}")
+                print(f"[hub] auth    = {'Bearer 已启用' if token else '关闭（仅本机使用）'}")
+                if not _is_loopback(host) and not token:
+                    print(f"[hub] !! 警告：服务暴露在 {host} 上且未启用认证（--allow-insecure 豁免）——"
+                          "同网段任何人都能派发任务")
+                print(f"[hub] card    = http://{shown}:{args.port}/.well-known/agent-card.json")
+                print(f"[hub] console = http://{shown}:{args.port}/console")
+                uvicorn.Server(config).run(sockets=[listener])
+        finally:
+            hub.store.close()
+
 
 
 def cmd_register(args: argparse.Namespace) -> None:

@@ -158,11 +158,14 @@ class A2AHttpAdapter(Adapter):
             resp = await client.get(url)
             resp.raise_for_status()
             card = resp.json()
+        self.apply_card(card)
+        return card
+
+    def apply_card(self, card: dict[str, Any]) -> None:
         self.last_card = card
         # 按 Card 声明的接口选 RPC 端点（A2A-15）：
         # 下游可能把 JSON-RPC 挂在 /rpc 而不是根路径，硬编码根路径会 404。
         self.rpc_url = self._pick_rpc_url(card)
-        return card
 
     def _pick_rpc_url(self, card: dict[str, Any]) -> str:
         """从 supportedInterfaces 里挑一个 JSONRPC 端点；挑不到就退回 base + '/'。
